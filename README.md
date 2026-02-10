@@ -2,6 +2,37 @@
 
 Unified macOS maintenance tool that consolidates multiple scripts into a single, non-interactive Python entrypoint with explicit `report`, `dry-run`, and `apply` modes.
 
+
+## Installation
+
+### Quick Install with Package Managers
+
+**Using [ubi](https://github.com/houseabsolute/ubi):**
+```bash
+ubi --project joshuascottpaul/mac-maintenance --in ~/.local/bin
+```
+
+**Using [bin](https://github.com/marcosnils/bin):**
+```bash
+bin install github.com/joshuascottpaul/mac-maintenance
+```
+
+### Manual Install
+
+```bash
+git clone https://github.com/joshuascottpaul/mac-maintenance.git
+cd mac-maintenance
+./mac_maintenance.py
+```
+
+### From Release
+
+```bash
+curl -L https://github.com/joshuascottpaul/mac-maintenance/releases/latest/download/mac_maintenance-v0.1.0-darwin-arm64.tar.gz | tar xz
+cd mac_maintenance-darwin-arm64
+./install.sh
+```
+
 ## Features
 
 - Single CLI for maintenance tasks
