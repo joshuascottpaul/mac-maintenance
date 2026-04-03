@@ -22,14 +22,14 @@ bin install github.com/joshuascottpaul/mac-maintenance
 ```bash
 git clone https://github.com/joshuascottpaul/mac-maintenance.git
 cd mac-maintenance
-./mac_maintenance.py
+./mac-maintenance.py
 ```
 
 ### From Release
 
 ```bash
-curl -L https://github.com/joshuascottpaul/mac-maintenance/releases/latest/download/mac_maintenance-v0.1.0-darwin-arm64.tar.gz | tar xz
-cd mac_maintenance-darwin-arm64
+curl -L https://github.com/joshuascottpaul/mac-maintenance/releases/latest/download/mac-maintenance-v0.1.0-darwin-arm64.tar.gz | tar xz
+cd mac-maintenance-darwin-arm64
 ./install.sh
 ```
 
@@ -44,7 +44,7 @@ cd mac_maintenance-darwin-arm64
 ## Install
 
 ```bash
-python3 /Users/jpaul/Desktop/mac_maintenance/mac_maintenance.py --help
+python3 /Users/jpaul/Desktop/mac-maintenance/mac-maintenance.py --help
 ```
 
 ## Quick Start
@@ -52,19 +52,19 @@ python3 /Users/jpaul/Desktop/mac_maintenance/mac_maintenance.py --help
 Report only (HTML):
 
 ```bash
-python3 mac_maintenance.py --mode report --task report-html --report-out-dir .
+python3 mac-maintenance.py --mode report --task report-html --report-out-dir .
 ```
 
 Dry-run maintenance tasks:
 
 ```bash
-python3 mac_maintenance.py --mode dry-run --task brew-maintenance --task cleanup-archives --brew-cleanup --brew-list
+python3 mac-maintenance.py --mode dry-run --task brew-maintenance --task cleanup-archives --brew-cleanup --brew-list
 ```
 
 Apply brew updates:
 
 ```bash
-python3 mac_maintenance.py --mode apply --task brew-maintenance --brew-update --brew-upgrade
+python3 mac-maintenance.py --mode apply --task brew-maintenance --brew-update --brew-upgrade
 ```
 
 ## Tests
