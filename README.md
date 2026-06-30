@@ -41,12 +41,6 @@ cd mac-maintenance-darwin-arm64
 - Safe defaults and explicit action flags
 - Pytest suite for core behaviors
 
-## Install
-
-```bash
-python3 /Users/jpaul/Desktop/mac-maintenance/mac-maintenance.py --help
-```
-
 ## Quick Start
 
 Report only (HTML):

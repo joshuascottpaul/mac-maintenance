@@ -2,7 +2,7 @@
 
 **Project**: Unified macOS Maintenance Tool
 
-**Location**: `/Users/jpaul/Desktop/mac_maintenance/mac_maintenance.py`
+**Location**: `mac-maintenance.py` (repo root)
 
 **Version**: Draft 1
 
@@ -61,7 +61,7 @@ The design prioritizes safety, transparency, and repeatability, with non-interac
 
 **6. Functional Requirements**
 
-- Provide a single entrypoint: `mac_maintenance.py`.
+- Provide a single entrypoint: `mac-maintenance.py`.
 - Support modes: `report`, `dry-run`, `apply`.
 - Support tasks:
 - `report-html`
@@ -100,9 +100,9 @@ The tool is a single Python module with the following layers.
 
 **9. Entry Points**
 
-- Main entrypoint: `mac_maintenance.py`
+- Main entrypoint: `mac-maintenance.py`
 - Example invocation:
-- `python3 mac_maintenance.py --mode report --task report-html --report-out-dir .`
+- `python3 mac-maintenance.py --mode report --task report-html --report-out-dir .`
 
 ---
 
@@ -180,6 +180,8 @@ Mode behavior rules.
 - Runs rsync to copy a source to destination.
 - Calculates throughput from source size and duration.
 - Does not run unless in `apply` mode.
+- `--copy-src` and `--copy-dst` have no default; both must be passed explicitly or the
+  task logs an error and exits without touching the filesystem.
 
 ---
 
@@ -300,9 +302,11 @@ Copy parameters.
 
 **19. Testing Strategy**
 
+- `pytest` suite in `tests/test_mac_maintenance.py` covers path validation, regex-based
+  parsing (hardware model, login items), mode-gating (dry-run/report never write or
+  delete), and report generation.
 - Manual dry-run validation of each task.
 - Report generation smoke test.
-- No automated tests yet; future work can add unit tests for utilities and report assembly.
 
 ---
 
@@ -326,16 +330,16 @@ Copy parameters.
 **22. Example Commands**
 
 - Report only:
-- `python3 mac_maintenance.py --mode report --task report-html --report-out-dir .`
+- `python3 mac-maintenance.py --mode report --task report-html --report-out-dir .`
 
 - Dry-run brew cleanup and archive cleanup:
-- `python3 mac_maintenance.py --mode dry-run --task brew-maintenance --task cleanup-archives --brew-cleanup --brew-list`
+- `python3 mac-maintenance.py --mode dry-run --task brew-maintenance --task cleanup-archives --brew-cleanup --brew-list`
 
 - Apply brew updates:
-- `python3 mac_maintenance.py --mode apply --task brew-maintenance --brew-update --brew-upgrade`
+- `python3 mac-maintenance.py --mode apply --task brew-maintenance --brew-update --brew-upgrade`
 
 - Apply archive cleanup:
-- `python3 mac_maintenance.py --mode apply --task cleanup-archives --archive-dir ~/Desktop/Orphaned_App_Support_Archives`
+- `python3 mac-maintenance.py --mode apply --task cleanup-archives --archive-dir ~/Desktop/Orphaned_App_Support_Archives`
 
 - Dry-run Chrome cleanup:
-- `python3 mac_maintenance.py --mode dry-run --task chrome-cleanup --chrome-dir "~/Library/Application Support/Google/Chrome Beta"`
+- `python3 mac-maintenance.py --mode dry-run --task chrome-cleanup --chrome-dir "~/Library/Application Support/Google/Chrome Beta"`

@@ -605,6 +605,25 @@ def _run_argv(argv: List[str], *, timeout_s: float) -> Tuple[float, int, str, st
     return duration_s, proc.returncode, _strip_ansi(proc.stdout), _strip_ansi(proc.stderr)
 
 
+def parse_ioreg_model(ioreg_output: str) -> Tuple[Optional[str], Optional[str]]:
+    model = None
+    model_number = None
+    if ioreg_output:
+        m = re.search(r'"model"\s*=\s*<"([^"]+)"', ioreg_output)
+        if m:
+            model = m.group(1).strip()
+        m2 = re.search(r'"model-number"\s*=\s*<([0-9A-Fa-f]+)>', ioreg_output)
+        if m2:
+            hex_bytes = m2.group(1)
+            try:
+                decoded = bytes.fromhex(hex_bytes).decode("utf-8", errors="ignore").strip("\x00").strip()
+                if decoded:
+                    model_number = decoded
+            except Exception:
+                pass
+    return model, model_number
+
+
 def hardware_quick_summary_result(*, timeout_s: float, max_chars: int, max_lines: int) -> CommandResult:
     title = "Hardware quick summary"
     cmd = "ioreg -rd1 -c IOPlatformExpertDevice; system_profiler SPHardwareDataType -json"
@@ -622,21 +641,7 @@ def hardware_quick_summary_result(*, timeout_s: float, max_chars: int, max_lines
         if err1.strip():
             stderr_parts.append(f"[ioreg stderr]\n{err1.strip()}")
 
-        model = None
-        model_number = None
-        if out1:
-            m = re.search(r'"model"\\s*=\\s*<"([^"]+)"', out1)
-            if m:
-                model = m.group(1).strip()
-            m2 = re.search(r'"model-number"\\s*=\\s*<([0-9A-Fa-f]+)>', out1)
-            if m2:
-                hex_bytes = m2.group(1)
-                try:
-                    decoded = bytes.fromhex(hex_bytes).decode("utf-8", errors="ignore").strip("\x00").strip()
-                    if decoded:
-                        model_number = decoded
-                except Exception:
-                    pass
+        model, model_number = parse_ioreg_model(out1)
 
         d2, rc2, out2, err2 = _run_argv(
             ["system_profiler", "SPHardwareDataType", "-json"], timeout_s=max(10.0, timeout_s)
@@ -734,6 +739,11 @@ def hardware_quick_summary_result(*, timeout_s: float, max_chars: int, max_lines
         )
 
 
+def parse_login_item_labels(launchctl_output: str) -> List[str]:
+    labels = sorted(set(re.findall(r"\b[A-Za-z0-9_.-]+\.loginitem\b", launchctl_output)))
+    return [l for l in labels if not l.startswith("com.apple.")]
+
+
 def login_items_quick_result(*, timeout_s: float, max_chars: int, max_lines: int) -> CommandResult:
     title = "Login items (ServiceManagement)"
     uid = os.getuid()
@@ -747,8 +757,7 @@ def login_items_quick_result(*, timeout_s: float, max_chars: int, max_lines: int
         if err0.strip():
             stderr_parts.append(err0.strip())
 
-        labels = sorted(set(re.findall(r"\\b[A-Za-z0-9_.-]+\\.loginitem\\b", out0)))
-        labels = [l for l in labels if not l.startswith("com.apple.")]
+        labels = parse_login_item_labels(out0)
 
         if not labels:
             out = "No ServiceManagement login items found via launchctl."
@@ -1353,7 +1362,7 @@ def generate_report(
 def validate_home_path(path: Path, label: str) -> Path:
     resolved = path.expanduser().resolve()
     home = Path.home().resolve()
-    if not str(resolved).startswith(str(home)):
+    if not resolved.is_relative_to(home):
         raise ValueError(f"{label} must be within {home}")
     return resolved
 
@@ -1417,7 +1426,6 @@ def task_cleanup_archives(archive_dir: Path, mode: str) -> None:
 def task_archive_orphans(app_support_dir: Path, archive_dir: Path, folders: List[str], days: int, mode: str) -> None:
     app_support_dir = app_support_dir.expanduser().resolve()
     archive_dir = validate_home_path(archive_dir, "archive-dir")
-    ensure_dir(archive_dir)
 
     delete_date = (dt.date.today() + dt.timedelta(days=days)).strftime("%Y-%m-%d")
     log(f"archive-orphans: delete date set to {delete_date}")
@@ -1435,6 +1443,7 @@ def task_archive_orphans(app_support_dir: Path, archive_dir: Path, folders: List
             log(f"would archive: {folder} -> {archive_path}")
             continue
 
+        ensure_dir(archive_dir)
         try:
             log(f"archiving: {folder}")
             proc = subprocess.run([
@@ -1580,15 +1589,8 @@ def task_brew_maintenance(
         maybe_run("untap", ["untap", "--force", "Homebrew/homebrew-bundle", "Homebrew/homebrew-services"])
 
     if do_list:
-        if mode == MODE_DRY_RUN:
+        if mode != MODE_APPLY:
             log(f"brew: would write list to {list_file}")
-        elif mode == MODE_REPORT:
-            proc = run_brew(brew_bin, ["list"])
-            if proc.returncode == 0:
-                list_file.write_text(proc.stdout)
-                log(f"brew: wrote list to {list_file}")
-            else:
-                log(f"brew: list failed: {proc.stderr.strip()}")
         else:
             proc = run_brew(brew_bin, ["list"])
             if proc.returncode == 0:
@@ -1598,7 +1600,7 @@ def task_brew_maintenance(
                 log(f"brew: list failed: {proc.stderr.strip()}")
 
     if do_cask_list:
-        if mode == MODE_DRY_RUN:
+        if mode != MODE_APPLY:
             log(f"brew: would write cask list to {cask_file}")
         else:
             proc = run_brew(brew_bin, ["list", "--cask"])
@@ -1636,7 +1638,10 @@ def task_brew_maintenance(
             return
 
         log(f"brew: reinstalling missing casks: {', '.join(missing_casks)}")
-        run_brew(brew_bin, ["uninstall", "--cask"] + missing_casks)
+        uninstall_proc = run_brew(brew_bin, ["uninstall", "--cask"] + missing_casks)
+        if uninstall_proc.returncode != 0:
+            log(f"brew: uninstall failed, skipping reinstall: {uninstall_proc.stderr.strip()}")
+            return
         run_brew(brew_bin, ["install", "--cask"] + missing_casks)
 
 
@@ -1703,19 +1708,22 @@ def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool) -> None:
                     for f in files:
                         try:
                             (Path(root) / f).unlink()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log(f"chrome-cleanup: failed to remove {Path(root) / f}: {e}")
                     for d in dirs:
                         try:
                             shutil.rmtree(Path(root) / d, ignore_errors=True)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log(f"chrome-cleanup: failed to remove {Path(root) / d}: {e}")
                 log(f"cleaned: {profile}/{name}")
             else:
                 log(f"would clean: {profile}/{name}")
 
 
 def task_copy_speed_test(src: Path, dst: Path, mode: str) -> None:
+    if not str(src) or not str(dst):
+        log("copy-speed-test: --copy-src and --copy-dst are required for this task")
+        return
     src = src.expanduser().resolve()
     dst = dst.expanduser().resolve()
     if not src.exists():
@@ -1829,8 +1837,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chrome-dir", default=str(Path.home() / "Library/Application Support/Google/Chrome Beta"))
     parser.add_argument("--kill-chrome", action="store_true")
 
-    parser.add_argument("--copy-src", default=str(Path("/Users/jpaul/Virtual Machines.localized")))
-    parser.add_argument("--copy-dst", default=str(Path("/Volumes/VMware")))
+    parser.add_argument("--copy-src", default="")
+    parser.add_argument("--copy-dst", default="")
 
     return parser.parse_args()
 
