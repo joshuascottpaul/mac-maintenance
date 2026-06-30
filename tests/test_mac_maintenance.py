@@ -1,11 +1,14 @@
 import importlib.util
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
 
 def load_module():
-    path = Path("/Users/jpaul/Desktop/mac_maintenance/mac_maintenance.py")
+    path = Path(__file__).parent.parent / "mac-maintenance.py"
     spec = importlib.util.spec_from_file_location("mac_maintenance", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -14,6 +17,17 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def home_tmp_path():
+    # validate_home_path() requires paths under Path.home(), so pytest's own
+    # tmp_path (under /private/var/folders/...) doesn't satisfy it.
+    path = Path(tempfile.mkdtemp(dir=Path.home(), prefix=".mac_maintenance_test_"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def test_validate_home_path_ok():
@@ -27,6 +41,41 @@ def test_validate_home_path_rejects_outside():
     m = load_module()
     with pytest.raises(ValueError):
         m.validate_home_path(Path("/etc"), "test")
+
+
+def test_validate_home_path_rejects_sibling_prefix():
+    m = load_module()
+    home = Path.home()
+    sibling = home.parent / (home.name + "evil")
+    with pytest.raises(ValueError):
+        m.validate_home_path(sibling, "test")
+
+
+def test_parse_ioreg_model_matches_real_output():
+    m = load_module()
+    sample = '"model" = <"Mac17,6">\n"model-number" = <5a314e3230303031410000>'
+    model, model_number = m.parse_ioreg_model(sample)
+    assert model == "Mac17,6"
+    assert model_number == "Z1N20001A"
+
+
+def test_parse_ioreg_model_no_match_returns_none():
+    m = load_module()
+    model, model_number = m.parse_ioreg_model("")
+    assert model is None
+    assert model_number is None
+
+
+def test_parse_login_item_labels_matches_real_output():
+    m = load_module()
+    sample = '"io.mountainduck.loginitem" => enabled\ncom.apple.xpc.loginitemregisterd'
+    assert m.parse_login_item_labels(sample) == ["io.mountainduck.loginitem"]
+
+
+def test_parse_login_item_labels_excludes_apple():
+    m = load_module()
+    sample = '"com.apple.something.loginitem" => enabled'
+    assert m.parse_login_item_labels(sample) == []
 
 
 def test_copy_speed_test_dry_run_no_rsync(tmp_path, monkeypatch, capsys):
@@ -47,9 +96,9 @@ def test_copy_speed_test_dry_run_no_rsync(tmp_path, monkeypatch, capsys):
     assert "would copy" in out
 
 
-def test_cleanup_archives_dry_run_keeps_files(tmp_path, capsys):
+def test_cleanup_archives_dry_run_keeps_files(home_tmp_path, capsys):
     m = load_module()
-    base = Path.home() / ".mac_maintenance_test" / "cleanup_archives"
+    base = home_tmp_path / "cleanup_archives"
     base.mkdir(parents=True, exist_ok=True)
     archive_dir = base / "archives"
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -63,9 +112,9 @@ def test_cleanup_archives_dry_run_keeps_files(tmp_path, capsys):
     assert "would delete" in out
 
 
-def test_archive_orphans_dry_run_no_delete(tmp_path, capsys):
+def test_archive_orphans_dry_run_no_delete(home_tmp_path, capsys):
     m = load_module()
-    base = Path.home() / ".mac_maintenance_test" / "archive_orphans"
+    base = home_tmp_path / "archive_orphans"
     base.mkdir(parents=True, exist_ok=True)
     app_support = base / "Application Support"
     app_support.mkdir(parents=True, exist_ok=True)
@@ -75,12 +124,12 @@ def test_archive_orphans_dry_run_no_delete(tmp_path, capsys):
 
     m.task_archive_orphans(app_support, archive_dir, ["SomeApp"], 10, m.MODE_DRY_RUN)
     assert folder.exists()
-    assert not any(archive_dir.glob("*.zip"))
+    assert not archive_dir.exists()
     out = capsys.readouterr().out
     assert "would archive" in out
 
 
-def test_brew_maintenance_dry_run_no_brew(monkeypatch, tmp_path, capsys):
+def test_brew_maintenance_dry_run_no_brew(monkeypatch, tmp_path, home_tmp_path, capsys):
     m = load_module()
     # Fake brew binary
     brew = tmp_path / "brew"
@@ -92,7 +141,7 @@ def test_brew_maintenance_dry_run_no_brew(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(m, "run_brew", fail_run)
 
-    base = Path.home() / ".mac_maintenance_test" / "brew"
+    base = home_tmp_path / "brew_lists"
     base.mkdir(parents=True, exist_ok=True)
 
     m.task_brew_maintenance(
@@ -116,6 +165,90 @@ def test_brew_maintenance_dry_run_no_brew(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "would run" in out
     assert "would write list" in out
+
+
+def test_brew_maintenance_report_mode_no_write(monkeypatch, tmp_path, home_tmp_path, capsys):
+    m = load_module()
+    brew = tmp_path / "brew"
+    brew.write_text("#!/bin/sh\nexit 0\n")
+    brew.chmod(0o755)
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("brew should not run for list/cask-list in report mode")
+
+    monkeypatch.setattr(m, "run_brew", fail_run)
+
+    base = home_tmp_path / "brew_report_lists"
+    base.mkdir(parents=True, exist_ok=True)
+    list_file = base / "list.txt"
+    cask_file = base / "cask.txt"
+
+    m.task_brew_maintenance(
+        mode=m.MODE_REPORT,
+        brew_bin=str(brew),
+        list_file=list_file,
+        cask_file=cask_file,
+        do_update=False,
+        do_upgrade=False,
+        do_upgrade_cask=False,
+        do_autoremove=False,
+        do_cleanup=False,
+        do_doctor=False,
+        do_missing=False,
+        do_list=True,
+        do_cask_list=True,
+        do_untap=False,
+        do_fix_casks=False,
+        fix_casks=[],
+    )
+    assert not list_file.exists()
+    assert not cask_file.exists()
+
+
+def test_fix_casks_skips_install_when_uninstall_fails(monkeypatch, tmp_path, home_tmp_path, capsys):
+    m = load_module()
+    brew = tmp_path / "brew"
+    brew.write_text("#!/bin/sh\nexit 0\n")
+    brew.chmod(0o755)
+
+    calls = []
+
+    def fake_run_brew(_brew_bin, args):
+        calls.append(args)
+        if args[:2] == ["list", "--cask"]:
+            return subprocess.CompletedProcess(args, 0, stdout="jupyterlab\n", stderr="")
+        if args[:2] == ["uninstall", "--cask"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="uninstall failed")
+        if args[:2] == ["install", "--cask"]:
+            raise AssertionError("install should not run when uninstall fails")
+        raise AssertionError(f"unexpected brew args: {args}")
+
+    monkeypatch.setattr(m, "run_brew", fake_run_brew)
+    monkeypatch.setattr(m.Path, "exists", lambda _self: False)
+
+    base = home_tmp_path / "fix_casks_lists"
+    base.mkdir(parents=True, exist_ok=True)
+
+    m.task_brew_maintenance(
+        mode=m.MODE_APPLY,
+        brew_bin=str(brew),
+        list_file=base / "list.txt",
+        cask_file=base / "cask.txt",
+        do_update=False,
+        do_upgrade=False,
+        do_upgrade_cask=False,
+        do_autoremove=False,
+        do_cleanup=False,
+        do_doctor=False,
+        do_missing=False,
+        do_list=False,
+        do_cask_list=False,
+        do_untap=False,
+        do_fix_casks=True,
+        fix_casks=["JupyterLab"],
+    )
+    assert ["uninstall", "--cask", "jupyterlab-app"] in calls
+    assert not any(c[:2] == ["install", "--cask"] for c in calls)
 
 
 def test_render_results_section_closing_order():

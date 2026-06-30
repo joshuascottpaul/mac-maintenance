@@ -67,7 +67,6 @@ jobs:
         \`\`\`
 
         ## Requirements
-        - Python 3.7+
-        - See requirements.txt for Python dependencies
+        - Python 3.7+ (standard library only, no extra dependencies)
 
         See [README.md](https://github.com/${{ github.repository }}#readme) for full documentation."
