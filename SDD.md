@@ -71,6 +71,11 @@ The design prioritizes safety, transparency, and repeatability, with non-interac
 - `cleanup-archives`
 - `chrome-cleanup`
 - `copy-speed-test`
+- `clean-caches`
+- `empty-trash`
+- `clean-logs`
+- `clean-ios-backups`
+- `find-bundle-orphans`
 - Support explicit flags for maintenance actions (brew update/upgrade/cleanup/etc.).
 - Generate HTML + CSS report output in a specified directory.
 - Preserve read-only behavior unless `--mode apply` is used.
@@ -183,6 +188,52 @@ Mode behavior rules.
 - `--copy-src` and `--copy-dst` have no default; both must be passed explicitly or the
   task logs an error and exits without touching the filesystem.
 
+**11.8 `clean-caches`**
+
+- Deletes immediate child entries of `--cache-dir` (default `~/Library/Caches`).
+- Skips any entry modified within `--cache-min-age` seconds (default 300) to avoid
+  racing an app that is actively writing to its cache.
+- Reports per-entry and total size before acting; `dry-run`/`report` only log what
+  would be deleted.
+
+**11.9 `empty-trash`**
+
+- Deletes immediate child entries of `--trash-dir` (default `~/.Trash`).
+- Same content-deletion mechanics as `clean-caches`, no age guard (items are
+  already user-deleted).
+
+**11.10 `clean-logs`**
+
+- Deletes immediate child entries of `--logs-dir` (default `~/Library/Logs`).
+- Same age-guard mechanics as `clean-caches`, via `--logs-min-age` (default 300s).
+
+**11.11 `clean-ios-backups`**
+
+- Scans `--ios-backups-dir` (default `~/Library/Application Support/MobileSync/Backup`)
+  for per-device backup directories.
+- Sorts by directory mtime; always keeps the `--ios-backups-keep` most recent
+  (default 1) untouched, regardless of mode.
+- Refuses to run if `--ios-backups-keep` is set below 1 (would delete all backups).
+
+**11.12 `find-bundle-orphans`**
+
+- Report-only (no `apply` action) — same caution as `find-orphans`.
+- Reads each installed app's real `CFBundleIdentifier` from
+  `/Applications/*.app/Contents/Info.plist` via `plistlib`, then does an **exact**
+  match (not fuzzy/substring) against entries in `~/Library/Containers`,
+  `~/Library/Preferences`, `~/Library/Saved Application State`, and
+  `~/Library/Application Scripts`.
+- This exists because those four locations are keyed by bundle identifier, not by
+  app display name — the fuzzy substring match `find-orphans` uses against
+  Application Support does not work there.
+- Entries are filtered to bundle-ID-shaped names (`segment.segment...`, at least
+  one dot) before matching, to exclude UUID-named containers and dotfiles that are
+  never going to look like a real bundle ID.
+- Known false-positive source: helper tools, browser extensions, and group
+  containers often use a different (frequently Team-ID-prefixed) bundle ID than
+  their parent app, so they appear as "orphans" even when legitimate. The tool
+  logs this caveat and defers all deletion decisions to manual review.
+
 ---
 
 **12. Data Model**
@@ -248,6 +299,16 @@ Copy parameters.
 - `--copy-src`
 - `--copy-dst`
 
+Cache, trash, logs, and iOS backup parameters.
+
+- `--cache-dir`
+- `--cache-min-age`
+- `--trash-dir`
+- `--logs-dir`
+- `--logs-min-age`
+- `--ios-backups-dir`
+- `--ios-backups-keep`
+
 ---
 
 **14. Safety and Security**
@@ -303,9 +364,12 @@ Copy parameters.
 **19. Testing Strategy**
 
 - `pytest` suite in `tests/test_mac_maintenance.py` covers path validation, regex-based
-  parsing (hardware model, login items), mode-gating (dry-run/report never write or
-  delete), and report generation.
+  parsing (hardware model, login items, orphan skip-list), mode-gating (dry-run/report
+  never write or delete), age-guarded content deletion (caches/trash/logs), iOS backup
+  retention, bundle-ID extraction and matching, and report generation.
 - Manual dry-run validation of each task.
+- Manual report-only run of `find-bundle-orphans` against the real machine to sanity
+  check noise levels before considering any deletion feature on top of it.
 - Report generation smoke test.
 
 ---

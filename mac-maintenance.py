@@ -14,6 +14,7 @@ import html
 import json
 import os
 import platform
+import plistlib
 import re
 import shlex
 import shutil
@@ -23,7 +24,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 MODE_REPORT = "report"
 MODE_DRY_RUN = "dry-run"
@@ -36,6 +37,25 @@ TASK_ARCHIVE_ORPHANS = "archive-orphans"
 TASK_CLEANUP_ARCHIVES = "cleanup-archives"
 TASK_CHROME = "chrome-cleanup"
 TASK_COPY = "copy-speed-test"
+TASK_CLEAN_CACHES = "clean-caches"
+TASK_EMPTY_TRASH = "empty-trash"
+TASK_CLEAN_LOGS = "clean-logs"
+TASK_CLEAN_IOS_BACKUPS = "clean-ios-backups"
+TASK_FIND_BUNDLE_ORPHANS = "find-bundle-orphans"
+
+DEFAULT_CACHE_MIN_AGE_SECONDS = 300.0
+DEFAULT_LOGS_MIN_AGE_SECONDS = 300.0
+DEFAULT_IOS_BACKUPS_KEEP = 1
+
+# Library locations where entries are named by bundle identifier rather than app
+# display name. Each maps a label to (path relative to home, name -> bundle-id fn).
+BUNDLE_ID_SCAN_LOCATIONS = {
+    "containers": ("Library/Containers", lambda name: name),
+    "preferences": ("Library/Preferences", lambda name: name[:-len(".plist")] if name.endswith(".plist") else name),
+    "saved-state": ("Library/Saved Application State", lambda name: name[:-len(".savedState")] if name.endswith(".savedState") else name),
+    "app-scripts": ("Library/Application Scripts", lambda name: name),
+}
+BUNDLE_ID_SHAPE_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 
 DEFAULT_ARCHIVE_DAYS = 90
 DEFAULT_ORPHANS_LIMIT = 30
@@ -54,9 +74,9 @@ DEFAULT_ARCHIVE_FOLDERS = [
 ]
 
 DEFAULT_ORPHANS_SKIP_RE = re.compile(
-    r"^(com\\.apple\\.|AddressBook|CallHistoryDB|CallHistoryTransactions|"
+    r"^(com\.apple\..*|AddressBook|CallHistoryDB|CallHistoryTransactions|"
     r"CloudDocs|CrashReporter|FileProvider|Knowledge|SyncServices|"
-    r"networkserviceproxy|icdd|default\\.store|Caches|Logs|MobileSync|"
+    r"networkserviceproxy|icdd|default\.store|Caches|Logs|MobileSync|"
     r"NotificationCenter|System Preferences|Automator|Dock|ControlCenter|"
     r"FaceTime|Mail|Music|iCloud|identityservicesd|locationaccessstored|"
     r"contactsd|accountsd|appplaceholdersyncd|homeenergyd|privatecloudcomputed|"
@@ -1373,7 +1393,12 @@ def ensure_dir(path: Path) -> Path:
 
 
 def human_size_kb(kb: int) -> str:
-    gb = kb / 1024 / 1024
+    if kb < 1024:
+        return f"{kb} KB"
+    mb = kb / 1024
+    if mb < 1024:
+        return f"{mb:.2f} MB"
+    gb = mb / 1024
     return f"{gb:.2f} GB"
 
 
@@ -1720,6 +1745,177 @@ def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool) -> None:
                 log(f"would clean: {profile}/{name}")
 
 
+def _clean_dir_contents(dir_path: Path, mode: str, label: str, min_age_s: float = 0.0) -> None:
+    dir_path = validate_home_path(dir_path, label)
+    if not dir_path.is_dir():
+        log(f"{label}: directory not found: {dir_path}")
+        return
+
+    now = time.time()
+    eligible: List[Path] = []
+    skipped_recent = 0
+    for entry in sorted(dir_path.iterdir(), key=lambda p: p.name):
+        try:
+            mtime = entry.stat().st_mtime
+        except Exception:
+            continue
+        if min_age_s and (now - mtime) < min_age_s:
+            skipped_recent += 1
+            continue
+        eligible.append(entry)
+
+    if skipped_recent:
+        log(f"{label}: skipped {skipped_recent} recently-modified entr"
+            f"{'y' if skipped_recent == 1 else 'ies'} (within {int(min_age_s)}s)")
+
+    if not eligible:
+        log(f"{label}: nothing eligible for cleanup")
+        return
+
+    total_kb = sum(du_kb(p) or 0 for p in eligible)
+    log(f"{label}: {len(eligible)} entr{'y' if len(eligible) == 1 else 'ies'} eligible, "
+        f"{human_size_kb(total_kb)} total")
+
+    for entry in eligible:
+        size = du_kb(entry)
+        size_str = human_size_kb(size) if size else "unknown"
+        if mode == MODE_APPLY:
+            try:
+                if entry.is_symlink() or entry.is_file():
+                    entry.unlink()
+                else:
+                    shutil.rmtree(entry)
+                log(f"{label}: deleted {entry.name} ({size_str})")
+            except Exception as e:
+                log(f"{label}: failed to delete {entry.name}: {e}")
+        else:
+            log(f"{label}: would delete {entry.name} ({size_str})")
+
+
+def task_clean_caches(cache_dir: Path, mode: str, min_age_s: float = DEFAULT_CACHE_MIN_AGE_SECONDS) -> None:
+    _clean_dir_contents(cache_dir, mode, "clean-caches", min_age_s=min_age_s)
+
+
+def task_empty_trash(trash_dir: Path, mode: str) -> None:
+    _clean_dir_contents(trash_dir, mode, "empty-trash", min_age_s=0.0)
+
+
+def task_clean_logs(logs_dir: Path, mode: str, min_age_s: float = DEFAULT_LOGS_MIN_AGE_SECONDS) -> None:
+    _clean_dir_contents(logs_dir, mode, "clean-logs", min_age_s=min_age_s)
+
+
+def task_clean_ios_backups(backups_dir: Path, mode: str, keep_latest: int = DEFAULT_IOS_BACKUPS_KEEP) -> None:
+    backups_dir = validate_home_path(backups_dir, "ios-backups-dir")
+    if not backups_dir.is_dir():
+        log(f"clean-ios-backups: directory not found: {backups_dir}")
+        return
+
+    if keep_latest < 1:
+        log("clean-ios-backups: --ios-backups-keep must be at least 1; refusing to delete all backups")
+        return
+
+    backups = [p for p in backups_dir.iterdir() if p.is_dir()]
+    if not backups:
+        log("clean-ios-backups: no backups found")
+        return
+
+    def backup_mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    backups.sort(key=backup_mtime, reverse=True)
+    keep = backups[:keep_latest]
+    candidates = backups[keep_latest:]
+
+    for p in keep:
+        log(f"clean-ios-backups: keeping {p.name} (most recent)")
+
+    if not candidates:
+        log("clean-ios-backups: nothing eligible for deletion")
+        return
+
+    total_kb = sum(du_kb(p) or 0 for p in candidates)
+    log(f"clean-ios-backups: {len(candidates)} backup(s) eligible for deletion, "
+        f"{human_size_kb(total_kb)} total")
+
+    for p in candidates:
+        size = du_kb(p)
+        size_str = human_size_kb(size) if size else "unknown"
+        if mode == MODE_APPLY:
+            try:
+                shutil.rmtree(p)
+                log(f"clean-ios-backups: deleted {p.name} ({size_str})")
+            except Exception as e:
+                log(f"clean-ios-backups: failed to delete {p.name}: {e}")
+        else:
+            log(f"clean-ios-backups: would delete {p.name} ({size_str})")
+
+
+def installed_bundle_ids(applications_dir: Path) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    try:
+        entries = list(applications_dir.iterdir())
+    except Exception as e:
+        log(f"find-bundle-orphans: failed to list {applications_dir}: {e}")
+        return result
+    for entry in entries:
+        if not entry.name.endswith(".app"):
+            continue
+        info_plist = entry / "Contents" / "Info.plist"
+        if not info_plist.is_file():
+            continue
+        try:
+            with info_plist.open("rb") as f:
+                data = plistlib.load(f)
+            bundle_id = data.get("CFBundleIdentifier")
+            if bundle_id:
+                result[bundle_id] = entry.name[:-len(".app")]
+        except Exception:
+            continue
+    return result
+
+
+def task_find_bundle_orphans(applications_dir: Path, limit: int) -> None:
+    installed = installed_bundle_ids(applications_dir)
+    log(f"find-bundle-orphans: {len(installed)} installed app bundle ID(s) found in {applications_dir}")
+    log("find-bundle-orphans: best-effort — matching is exact against each app's own "
+        "CFBundleIdentifier only. Helper tools, browser extensions, and group containers "
+        "often use a different (e.g. Team-ID-prefixed) bundle ID than their parent app and "
+        "will show up here even though they are legitimate. This is report-only — review "
+        "each entry yourself before deleting anything.")
+
+    home = Path.home()
+    for label, (rel_dir, normalize) in BUNDLE_ID_SCAN_LOCATIONS.items():
+        scan_dir = home / rel_dir
+        if not scan_dir.is_dir():
+            log(f"find-bundle-orphans: {label}: directory not found: {scan_dir}")
+            continue
+        try:
+            entries = sorted(p.name for p in scan_dir.iterdir())
+        except Exception as e:
+            log(f"find-bundle-orphans: {label}: failed to list {scan_dir}: {e}")
+            continue
+
+        orphans: List[str] = []
+        for name in entries:
+            bundle_id = normalize(name)
+            if not BUNDLE_ID_SHAPE_RE.match(bundle_id):
+                continue
+            if bundle_id.startswith("com.apple."):
+                continue
+            if bundle_id not in installed:
+                orphans.append(name)
+
+        log(f"find-bundle-orphans: {label}: {len(orphans)} potential orphan(s) of {len(entries)} scanned")
+        for name in orphans[:limit]:
+            full = scan_dir / name
+            size = du_kb(full)
+            size_str = human_size_kb(size) if size else "unknown"
+            log(f"  {label}/{name} ({size_str})")
+
+
 def task_copy_speed_test(src: Path, dst: Path, mode: str) -> None:
     if not str(src) or not str(dst):
         log("copy-speed-test: --copy-src and --copy-dst are required for this task")
@@ -1797,6 +1993,11 @@ def parse_args() -> argparse.Namespace:
             TASK_CLEANUP_ARCHIVES,
             TASK_CHROME,
             TASK_COPY,
+            TASK_CLEAN_CACHES,
+            TASK_EMPTY_TRASH,
+            TASK_CLEAN_LOGS,
+            TASK_CLEAN_IOS_BACKUPS,
+            TASK_FIND_BUNDLE_ORPHANS,
         ],
         help="Task to run (repeatable).",
     )
@@ -1839,6 +2040,20 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--copy-src", default="")
     parser.add_argument("--copy-dst", default="")
+
+    parser.add_argument("--cache-dir", default=str(Path.home() / "Library/Caches"))
+    parser.add_argument("--cache-min-age", type=float, default=DEFAULT_CACHE_MIN_AGE_SECONDS)
+
+    parser.add_argument("--trash-dir", default=str(Path.home() / ".Trash"))
+
+    parser.add_argument("--logs-dir", default=str(Path.home() / "Library/Logs"))
+    parser.add_argument("--logs-min-age", type=float, default=DEFAULT_LOGS_MIN_AGE_SECONDS)
+
+    parser.add_argument(
+        "--ios-backups-dir",
+        default=str(Path.home() / "Library/Application Support/MobileSync/Backup"),
+    )
+    parser.add_argument("--ios-backups-keep", type=int, default=DEFAULT_IOS_BACKUPS_KEEP)
 
     return parser.parse_args()
 
@@ -1914,6 +2129,21 @@ def main() -> int:
 
     if TASK_COPY in tasks:
         task_copy_speed_test(Path(args.copy_src), Path(args.copy_dst), mode)
+
+    if TASK_CLEAN_CACHES in tasks:
+        task_clean_caches(Path(args.cache_dir), mode, min_age_s=args.cache_min_age)
+
+    if TASK_EMPTY_TRASH in tasks:
+        task_empty_trash(Path(args.trash_dir), mode)
+
+    if TASK_CLEAN_LOGS in tasks:
+        task_clean_logs(Path(args.logs_dir), mode, min_age_s=args.logs_min_age)
+
+    if TASK_CLEAN_IOS_BACKUPS in tasks:
+        task_clean_ios_backups(Path(args.ios_backups_dir), mode, keep_latest=args.ios_backups_keep)
+
+    if TASK_FIND_BUNDLE_ORPHANS in tasks:
+        task_find_bundle_orphans(Path(args.applications_dir), limit=args.orphans_limit)
 
     return 0
 
