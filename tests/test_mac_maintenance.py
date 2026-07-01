@@ -464,3 +464,220 @@ def test_find_bundle_orphans_matches_exact_bundle_id(monkeypatch, tmp_path, caps
     assert "containers/com.apple.somesystemthing" not in out
     assert "00F2F88D-E153-49FF-9C2D-87944A99BEE2" not in out
     assert "containers/.GlobalPreferences" not in out
+
+
+def test_process_running_reads_pgrep_returncode(monkeypatch):
+    m = load_module()
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    assert m.process_running("Some App") is True
+    # -x (exact name match), NOT -f (command-line substring) — see process_running docstring.
+    assert calls == [["/usr/bin/pgrep", "-x", "Some App"]]
+
+
+def test_process_running_false_when_pgrep_nonzero(monkeypatch):
+    m = load_module()
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 1),
+    )
+    assert m.process_running("Nope") is False
+
+
+def test_close_app_uses_exact_match_pkill(monkeypatch):
+    m = load_module()
+    calls = []
+
+    def fake_run(argv, **_k):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.time, "sleep", lambda _s: None)
+    # Report still-running after every attempt so both pkill fallbacks fire.
+    monkeypatch.setattr(m, "process_running", lambda name: True)
+
+    result = m.close_app("Safari")
+    assert result is False  # still running after KILL
+    # osascript quit first, then TERM and KILL both with -x (exact), never -f.
+    assert calls[0][:2] == ["/usr/bin/osascript", "-e"]
+    assert ["/usr/bin/pkill", "-TERM", "-x", "Safari"] in calls
+    assert ["/usr/bin/pkill", "-KILL", "-x", "Safari"] in calls
+    assert not any("-f" in c for c in calls)
+
+
+def test_chrome_cleanup_uses_custom_process_name(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    seen = []
+    monkeypatch.setattr(m, "process_running", lambda name: seen.append(name) or True)
+
+    chrome_dir = home_tmp_path / "Chrome"
+    chrome_dir.mkdir()
+
+    # Running + no kill flag -> should bail with a message naming the custom process.
+    m.task_chrome_cleanup(chrome_dir, m.MODE_DRY_RUN, kill_chrome=False,
+                          process_name="Google Chrome")
+    out = capsys.readouterr().out
+    assert seen == ["Google Chrome"]
+    assert "Google Chrome is running" in out
+    assert "Chrome Beta" not in out
+
+
+def test_safari_cleanup_visits_all_targets_dry_run(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    monkeypatch.setattr(m, "process_running", lambda name: False)
+
+    cache = home_tmp_path / "cache"
+    fav = home_tmp_path / "fav"
+    web = home_tmp_path / "web"
+    for d in (cache, fav, web):
+        d.mkdir()
+
+    m.task_safari_cleanup(m.MODE_DRY_RUN, False, cache, fav, web)
+    out = capsys.readouterr().out
+    assert "safari-cleanup:cache: nothing eligible" in out
+    assert "safari-cleanup:favicons: nothing eligible" in out
+    assert "safari-cleanup:website-data: nothing eligible" in out
+
+
+def test_safari_cleanup_running_no_kill_bails(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    monkeypatch.setattr(m, "process_running", lambda name: True)
+    cache = home_tmp_path / "cache"
+    cache.mkdir()
+
+    m.task_safari_cleanup(m.MODE_DRY_RUN, False, cache, cache, cache)
+    out = capsys.readouterr().out
+    assert "Safari is running" in out
+    assert "nothing eligible" not in out
+
+
+def test_safari_cleanup_kill_then_clean(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    monkeypatch.setattr(m, "process_running", lambda name: True)
+    close_calls = []
+    monkeypatch.setattr(m, "close_app", lambda name: close_calls.append(name) or True)
+
+    cache = home_tmp_path / "cache"
+    fav = home_tmp_path / "fav"
+    web = home_tmp_path / "web"
+    for d in (cache, fav, web):
+        d.mkdir()
+
+    # Running + --kill-safari + apply: should close Safari, then visit all three targets.
+    m.task_safari_cleanup(m.MODE_APPLY, True, cache, fav, web)
+    out = capsys.readouterr().out
+    assert close_calls == ["Safari"]
+    assert "safari-cleanup:cache: nothing eligible" in out
+    assert "safari-cleanup:favicons: nothing eligible" in out
+    assert "safari-cleanup:website-data: nothing eligible" in out
+
+
+def test_find_launch_agents_reports_label_and_program(monkeypatch, tmp_path, capsys):
+    m = load_module()
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    with (agents / "com.example.updater.plist").open("wb") as f:
+        m.plistlib.dump(
+            {
+                "Label": "com.example.updater",
+                "ProgramArguments": ["/usr/local/bin/updater", "--daemon"],
+                "RunAtLoad": True,
+            },
+            f,
+        )
+    monkeypatch.setattr(m, "_launch_agent_loaded", lambda uid, label: False)
+
+    m.task_find_launch_agents(agents)
+    out = capsys.readouterr().out
+    assert "com.example.updater" in out
+    assert "RunAtLoad" in out
+    assert "/usr/local/bin/updater" in out
+
+
+def test_find_launch_agents_survives_nondict_and_missing_fields(monkeypatch, tmp_path, capsys):
+    m = load_module()
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    # Valid plist whose root is an array, not a dict — must not crash the task.
+    with (agents / "com.bad.array.plist").open("wb") as f:
+        m.plistlib.dump(["not", "a", "dict"], f)
+    # Valid dict plist with no Label, no Program, no ProgramArguments — falls back to stem.
+    with (agents / "com.bare.noprogram.plist").open("wb") as f:
+        m.plistlib.dump({"RunAtLoad": False}, f)
+    monkeypatch.setattr(m, "_launch_agent_loaded", lambda uid, label: False)
+
+    m.task_find_launch_agents(agents)  # must not raise
+    out = capsys.readouterr().out
+    assert "com.bad.array" in out and "not a dict" in out
+    assert "com.bare.noprogram" in out  # label falls back to plist stem
+
+
+def test_disable_startup_item_dry_run_does_not_call_launchctl(monkeypatch, capsys):
+    m = load_module()
+
+    def fail_run(*_a, **_k):
+        raise AssertionError("launchctl must not run in dry-run")
+
+    monkeypatch.setattr(m.subprocess, "run", fail_run)
+    m._disable_startup_item("com.example.thing", m.MODE_DRY_RUN, "disable-login-item")
+    out = capsys.readouterr().out
+    assert "would run launchctl disable" in out
+    assert "com.example.thing" in out
+
+
+def test_disable_startup_item_apply_calls_launchctl(monkeypatch, capsys):
+    m = load_module()
+    calls = []
+
+    def fake_run(argv, **_k):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.os, "getuid", lambda: 501)
+    m._disable_startup_item("com.example.thing", m.MODE_APPLY, "disable-launch-agent")
+    out = capsys.readouterr().out
+    assert calls == [["/bin/launchctl", "disable", "gui/501/com.example.thing"]]
+    assert "disabled com.example.thing" in out
+    assert "launchctl enable gui/501/com.example.thing" in out
+
+
+def test_disable_startup_item_apply_logs_failure(monkeypatch, capsys):
+    m = load_module()
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom"),
+    )
+    m._disable_startup_item("com.example.thing", m.MODE_APPLY, "disable-login-item")
+    out = capsys.readouterr().out
+    assert "failed to disable com.example.thing: boom" in out
+
+
+def test_disable_login_item_nothing_to_do(monkeypatch, capsys):
+    m = load_module()
+
+    def fail_run(*_a, **_k):
+        raise AssertionError("must not touch launchctl when no labels given")
+
+    monkeypatch.setattr(m.subprocess, "run", fail_run)
+    m.task_disable_login_item([], m.MODE_APPLY)
+    out = capsys.readouterr().out
+    assert "nothing to do" in out
+
+
+def test_disable_launch_agent_nothing_to_do(monkeypatch, capsys):
+    m = load_module()
+
+    def fail_run(*_a, **_k):
+        raise AssertionError("must not touch launchctl when no labels given")
+
+    monkeypatch.setattr(m.subprocess, "run", fail_run)
+    m.task_disable_launch_agent([], m.MODE_APPLY)
+    out = capsys.readouterr().out
+    assert "nothing to do" in out

@@ -138,13 +138,27 @@ plan as written.
   surfaces. Do this only after living with the report output for a while and
   confirming the false-positive rate is tolerable for your own machine.
 
-### 2D. Stretch goals (still open)
+### 2D. Stretch goals
 
-- [ ] Login items: add `--task disable-login-item <label>` (currently report-only)
-- [ ] Launch agents: add `--task disable-launch-agent <label>`
-- [ ] Browser history/cookies: extend beyond Chrome Beta to stable Chrome, Safari, Firefox
-- [ ] Recent items: clear `NSRecentDocuments` plists
-- [ ] 2C deletion wiring (see above)
+- [x] **Login items**: `--task disable-login-item --login-item <label>` (repeatable).
+- [x] **Launch agents**: `--task disable-launch-agent --launch-agent <label>`
+  (repeatable), plus a new report-only `--task find-launch-agents` that parses
+  `~/Library/LaunchAgents/*.plist` and shows Label/Program/RunAtLoad/loaded state.
+  Both disable tasks share one `_disable_startup_item()` helper running
+  `launchctl disable gui/$UID/<label>` (reversible via `launchctl enable`); never
+  auto-acts — labels must be named explicitly.
+- [x] **Browsers**: generalized `chrome-cleanup` to any Chromium channel via
+  `--chrome-process-name` (default still Chrome Beta, so existing behavior
+  unchanged); point `--chrome-dir` at stable Chrome + `--chrome-process-name
+  "Google Chrome"`. New `safari-cleanup` clears Safari cache + favicon +
+  per-site WebKit data only — deliberately **not** History.db, Bookmarks, or the
+  shared Cookies.binarycookies.
+- [ ] **Firefox**: not done — Firefox uses a different profile/cache layout
+  (`~/Library/Application Support/Firefox/Profiles/*`, `~/Library/Caches/Firefox`);
+  deferred as a separate follow-up.
+- [ ] **Recent items**: clear `NSRecentDocuments` plists — still open.
+- [ ] **2C deletion wiring** (see above) — still deferred pending real-world
+  false-positive assessment.
 
 ---
 
@@ -172,14 +186,106 @@ and Logs cleanup (CMM's highest-volume disk-recovery actions) now exist with
 dry-run-by-default safety. App-leftover detection is now bundle-ID-accurate
 instead of fuzzy-matched, though still report-only.
 
+---
+
+## Re-run verdict — Track 2D (browsers + startup items) complete
+
+Confirmed by 38/38 passing tests plus live smoke tests: `find-launch-agents`
+ran read-only against the real machine (parsed 23 plists, gracefully skipped one
+genuinely malformed plist without crashing), stable-Chrome `chrome-cleanup`
+dry-run found the real Default profile via `--chrome-process-name "Google
+Chrome"`, `safari-cleanup` dry-run correctly detected Safari running and bailed,
+and `disable-launch-agent` dry-run printed the exact `launchctl disable` command
+without executing it. All destructive/process-control paths are monkeypatched in
+tests — no test quits an app or disables a real startup item.
+
+Shipped: multi-channel Chromium cleanup, Safari cache/site-data cleanup,
+LaunchAgent discovery, and reversible login-item / launch-agent disabling.
+
 ## Recommended next action
 
 1. **Live with `find-bundle-orphans` for a while** before wiring up deletion for
    it — the false-positive rate from helper-tool/Team-ID bundle IDs is real and
    disclosed; deleting based on it today would be premature.
-2. **2D stretch goals** (login item / launch agent disable, multi-browser privacy,
-   recent items) are the next clear chunk of CMM feature-parity work.
-3. The three deferred Track 1C minor items (`run_brew` timeout typing,
+2. **Remaining 2D**: Firefox cleanup (different profile/cache layout) and
+   `NSRecentDocuments` recent-items clearing.
+3. The two deferred Track 1C minor items (`run_brew` timeout typing,
    `time.time()` → `time.monotonic()` in copy-speed-test) are still just sitting
    there — low priority, fine to bundle into whatever PR touches those functions
    next rather than a dedicated pass.
+
+---
+
+## Track 3 — Backup & rollback for destructive tasks
+
+### Assessment (as of this review)
+
+Inventory of every destructive call and its reversibility **today**:
+
+| Task | Destructive op | Reversible today? |
+|---|---|---|
+| `disable-login-item` / `disable-launch-agent` | `launchctl disable` | ✅ Yes — `launchctl enable gui/$UID/<label>` (undo command printed in the log) |
+| `archive-orphans` | zip, then `rmtree` original | ✅ Effectively — the zip is the backup; unzip restores |
+| `cleanup-archives` | `unlink` expired zip | ⚠️ No — intended end-of-life for archives past their delete date; leaving as-is |
+| `clean-caches` | `unlink`/`rmtree` | ❌ No backup, no rollback |
+| `clean-logs` | `unlink`/`rmtree` | ❌ No backup, no rollback |
+| `empty-trash` | `unlink`/`rmtree` | ❌ No (and it *is* the Trash — permanent by definition) |
+| `chrome-cleanup` / `safari-cleanup` | `unlink`/`rmtree` | ❌ No backup, no rollback |
+| `clean-ios-backups` | `rmtree` | ❌ No — **highest-value / often-irreplaceable data in the tool** |
+
+**Gap:** six file-deletion tasks permanently delete with only dry-run as the
+safety net, and there is no `restore` command anywhere. `clean-ios-backups` is
+the sharpest risk (device backups may be the only copy of photos/messages).
+
+### Decision (confirmed with owner): move-to-Trash by default
+
+- The five recoverable deletion tasks — `clean-caches`, `clean-logs`,
+  `safari-cleanup`, `chrome-cleanup`, `clean-ios-backups` — move items to the
+  macOS Trash instead of `unlink`/`rmtree`. Rollback = recover from Trash
+  (drag out, or Finder "Put Back").
+- `empty-trash` is exempt (it *is* the Trash) and stays a permanent delete.
+- A new `--permanent` flag opts back into immediate `unlink`/`rmtree` for users
+  who want the space reclaimed now rather than on Trash-empty.
+- `cleanup-archives` / `archive-orphans` are unchanged — archive-orphans already
+  backs up (zip), and cleanup-archives only removes already-expired archives.
+
+### Verified mechanism (stdlib-only, consistent with existing architecture)
+
+`osascript -l JavaScript` → `NSFileManager.trashItemAtURLResultingItemURLError`.
+This is the same native trash API Finder uses; verified live on this machine —
+a probe file moved out of its origin into `~/.Trash` and was recoverable. Uses
+only `osascript`, a system binary the tool already shells out to (like `pgrep`,
+`du`, `launchctl`, `zip`), so it keeps the "no third-party deps / no PyObjC"
+constraint.
+
+**Honest caveat:** recovery-from-Trash is guaranteed (item is not destroyed
+until Trash is emptied). Finder's *"Put Back to exact original path"* is a Finder
+feature; `trashItemAtURL:` is the API Finder itself uses so it is expected to
+work, but a quick `mdls`/`xattr` probe did not positively confirm the put-back
+record (Finder stores it separately, not as an xattr). The substantive win —
+deletions become recoverable rather than immediate — is confirmed regardless.
+
+### Reversibility after Track 3 lands
+
+| Task | After Track 3 |
+|---|---|
+| `clean-caches` / `clean-logs` / `safari-cleanup` / `chrome-cleanup` | ✅ Recoverable from Trash (unless `--permanent`) |
+| `clean-ios-backups` | ✅ Recoverable from Trash (unless `--permanent`) |
+| `empty-trash` | ❌ Permanent (by definition) |
+| `disable-*` | ✅ Already reversible (`launchctl enable`) |
+
+### Implementation scope (not yet built — awaiting go)
+
+1. `move_to_trash(path) -> bool` helper wrapping the verified `osascript` JXA call;
+   log + return False on failure (never silently lose the caller's intent).
+2. `_clean_dir_contents`, `task_clean_ios_backups`, `task_chrome_cleanup`: route
+   the apply-mode delete through `move_to_trash` unless `--permanent`. For
+   `chrome-cleanup`, trash the whole named cache subdir rather than walking file
+   by file (fewer Trash items; Chrome regenerates the dir) — small, equivalent
+   behavior change to note in the PR.
+3. `--permanent` CLI flag; thread through the affected tasks. `empty-trash`
+   ignores it.
+4. Tests: assert non-permanent apply calls `move_to_trash` (monkeypatched) and
+   never `unlink`/`rmtree`; assert `--permanent` does the reverse; assert
+   `empty-trash` stays permanent regardless.
+5. Docs: README example + note; SDD §14 safety (recoverability); this file.
