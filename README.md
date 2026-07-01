@@ -39,6 +39,8 @@ cd mac-maintenance-darwin-arm64
 - Explicit modes: `report`, `dry-run`, `apply`
 - HTML + CSS report generation
 - Safe defaults and explicit action flags
+- Disk cleanup: caches, Trash, logs, iOS backups (age-guarded, dry-run by default)
+- Bundle-ID-based orphan detection across Containers/Preferences/Saved State/App Scripts (report-only)
 - Pytest suite for core behaviors
 
 ## Quick Start
@@ -59,6 +61,18 @@ Apply brew updates:
 
 ```bash
 python3 mac-maintenance.py --mode apply --task brew-maintenance --brew-update --brew-upgrade
+```
+
+Dry-run disk cleanup (caches, Trash, logs):
+
+```bash
+python3 mac-maintenance.py --mode dry-run --task clean-caches --task empty-trash --task clean-logs
+```
+
+Find potential app leftovers by bundle ID (report-only, no deletion):
+
+```bash
+python3 mac-maintenance.py --mode report --task find-bundle-orphans
 ```
 
 ## Tests

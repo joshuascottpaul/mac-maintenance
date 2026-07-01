@@ -68,54 +68,83 @@ verified line numbers: see the test plan this was executed from.
 
 ## Track 2 — CleanMyMac Feature Gaps
 
-### Current fitness: ~25–30% of CMM feature surface
+### Critique of the original plan (before implementation)
 
-The tool is strong at Homebrew management and system health reporting. CMM's core
-disk-recovery features (caches, logs, Trash) are entirely absent.
+The original 2C sketch ("extend `find-orphans` to also scan Containers/Preferences/
+Saved State/App Scripts, match the same way Application Support is matched today")
+was flawed. `find-orphans`'s matching is **fuzzy substring on app display name**
+(folder `"Slack"` vs app `"Slack.app"`). That breaks for the four new locations:
+`~/Library/Preferences` files and `~/Library/Containers` dirs are named by **bundle
+identifier** (`com.tinyspeck.slackmacgap.plist`), not display name. A substring
+match would silently produce garbage — exactly the "looks fine, silently wrong"
+bug class Track 1 was about eliminating. Fixed by redesigning 2C around real
+`CFBundleIdentifier` extraction (see below) instead of implementing the original
+plan as written.
 
-### 2A. Gap 1 — System cache cleanup (highest priority)
+### Bonus finds while implementing (same bug class as Track 1, missed in the original review)
 
-CMM's #1 disk-recovery action. Typically 2–10 GB on an active machine.
+- [x] **`DEFAULT_ORPHANS_SKIP_RE` had the exact Track 1 double-backslash regex bug**
+  — `com\\.apple\\.` and `default\\.store` never matched real folder names, so
+  `find-orphans` wasn't actually filtering out Apple-owned folders as intended.
+  Fixed, plus a second latent bug in the same regex: the trailing `$` anchor forced
+  a full-string match, so even with the backslash fixed, `com\.apple\.` (clearly a
+  prefix) still couldn't match `com.apple.Safari` — needed `com\.apple\..*`.
+  Regression test: `test_default_orphans_skip_re_matches_real_folder_names`.
+- [x] **`human_size_kb` always showed GB** (1 KB → "0.00 GB") — fixed with KB/MB/GB
+  thresholds, since cache/log entries are frequently small. This was deferred in
+  Track 1 but became directly relevant once Track 2 started surfacing these sizes.
 
-- [ ] Add `task_clean_caches()` function
-  - Targets: `~/Library/Caches/*` (per-app cache dirs), optionally `/Library/Caches`
-  - Dry-run: list each dir + size (use `du_kb`), total estimate
-  - Apply: delete contents of each subdir (not the dir itself), log per-app bytes freed
-  - Protect: skip dirs still being written to (check mtime < N minutes), skip any dir
-    not owned by the current user
-  - Wire to `--task clean-caches` flag
+### 2A. Cache cleanup — ✅ DONE
 
-### 2B. Gap 2 — Trash + Logs + iOS Backups empty
+- [x] `task_clean_caches()` — deletes immediate children of `--cache-dir` (default
+  `~/Library/Caches`), skips anything modified within `--cache-min-age` seconds
+  (default 300s) to avoid racing an app mid-write. Per-entry + total size reporting.
+  Wired to `--task clean-caches`.
 
-Safe, bounded, typically 5–20 GB combined. Three separate tasks.
+### 2B. Trash + Logs + iOS Backups — ✅ DONE
 
-- [ ] `task_empty_trash()` — `~/.Trash`, with dry-run size report
-- [ ] `task_clean_logs()` — `~/Library/Logs/*`, dry-run first
-- [ ] `task_clean_ios_backups()` — `~/Library/Application Support/MobileSync/Backup/*`
-  - Dry-run: list each backup, date, and size
-  - Apply: require explicit `--keep-latest-n` arg (default 1) so the most recent backup
-    is never auto-deleted
-- [ ] Add `--task empty-trash`, `--task clean-logs`, `--task clean-ios-backups` flags
+- [x] `task_empty_trash()` — `~/.Trash` (`--trash-dir`), no age guard (items are
+  already user-deleted). `--task empty-trash`.
+- [x] `task_clean_logs()` — `~/Library/Logs` (`--logs-dir`), same age-guard
+  mechanics as caches via `--logs-min-age`. `--task clean-logs`.
+- [x] `task_clean_ios_backups()` — `~/Library/Application Support/MobileSync/Backup`
+  (`--ios-backups-dir`), sorts by mtime, always keeps `--ios-backups-keep` most
+  recent (default 1), refuses to run if set below 1. `--task clean-ios-backups`.
+- All three share a `_clean_dir_contents()` helper (cache/trash/logs are
+  structurally identical: delete top-level entries, dry-run support, optional age
+  guard) — avoided triplicating the same loop.
 
-### 2C. Gap 3 — Complete application leftover cleanup
+### 2C. Application leftovers — bundle-ID detection ✅ DONE, deletion deferred
 
-Currently `find-orphans` / `archive-orphans` cover only `~/Library/Application Support`.
-Full CMM-equivalent coverage needs four more locations.
+- [x] `installed_bundle_ids()` — reads each `/Applications/*.app/Contents/Info.plist`
+  via stdlib `plistlib`, returns `{CFBundleIdentifier: app_name}`. No shelling out.
+- [x] `task_find_bundle_orphans()` — exact-match (not fuzzy) against
+  `~/Library/Containers`, `~/Library/Preferences`, `~/Library/Saved Application State`,
+  `~/Library/Application Scripts`. Filters to bundle-ID-shaped names (`segment.segment`,
+  ≥1 dot) before matching, which excludes UUID-named containers and dotfiles.
+  **Report-only** — same caution `find-orphans` already exercises today; no
+  delete/archive action wired up yet.
+- [x] Verified live against this machine (read-only): tightening the shape filter
+  cut "potential orphan" counts roughly 25–30% (containers 420→309, preferences
+  669→524, app-scripts 488→360) by removing UUID/dotfile noise. Residual noise is
+  real and disclosed in the tool's own output: helper tools, browser extensions,
+  and group containers often use a different (frequently Team-ID-prefixed) bundle
+  ID than their parent app, so they show up as "orphans" even when legitimate —
+  this is an inherent limit of bundle-ID-only matching, not a bug to chase further
+  without building out a real signature database (out of scope for this tool).
+- [ ] **Deferred**: wiring an `archive`/`delete` action on top of
+  `find-bundle-orphans`'s output, mirroring how `archive-orphans` requires an
+  explicit user-curated folder list rather than auto-deleting anything `find-orphans`
+  surfaces. Do this only after living with the report output for a while and
+  confirming the false-positive rate is tolerable for your own machine.
 
-- [ ] Extend `task_find_orphans` to also scan:
-  - `~/Library/Containers`
-  - `~/Library/Preferences` (match `com.AppName.*` plist files)
-  - `~/Library/Saved Application State`
-  - `~/Library/Application Scripts`
-- [ ] Extend `task_archive_orphans` / `task_cleanup_orphans` to act on the same set
-- [ ] Update `--orphan-search-dirs` default list and README
-
-### 2D. Stretch goals (post-gap-3)
+### 2D. Stretch goals (still open)
 
 - [ ] Login items: add `--task disable-login-item <label>` (currently report-only)
 - [ ] Launch agents: add `--task disable-launch-agent <label>`
 - [ ] Browser history/cookies: extend beyond Chrome Beta to stable Chrome, Safari, Firefox
 - [ ] Recent items: clear `NSRecentDocuments` plists
+- [ ] 2C deletion wiring (see above)
 
 ---
 
@@ -133,10 +162,24 @@ The tool's output is now trustworthy where it previously failed silently.
 
 ---
 
+## Re-run verdict — Track 2A/2B/2C-report complete
+
+Confirmed by 27/27 passing tests, a live read-only `find-bundle-orphans` run
+against this machine, and a CLI smoke test of `clean-caches`/`empty-trash`/
+`clean-ios-backups` against a throwaway scratch directory under home (never
+against real `~/Library`). CleanMyMac fitness moves meaningfully: caches, Trash,
+and Logs cleanup (CMM's highest-volume disk-recovery actions) now exist with
+dry-run-by-default safety. App-leftover detection is now bundle-ID-accurate
+instead of fuzzy-matched, though still report-only.
+
 ## Recommended next action
 
-**Track 2 — CleanMyMac Feature Gaps** is next. Start with 2A (cache cleanup task) —
-it's CMM's highest-volume disk-recovery action and the rest of the section spells
-out the exact target directories and safety constraints (skip dirs mid-write, skip
-non-owned dirs). 2B (Trash/Logs/iOS backups) is the natural follow-on since all
-three are simple, bounded, apply-gated deletions.
+1. **Live with `find-bundle-orphans` for a while** before wiring up deletion for
+   it — the false-positive rate from helper-tool/Team-ID bundle IDs is real and
+   disclosed; deleting based on it today would be premature.
+2. **2D stretch goals** (login item / launch agent disable, multi-browser privacy,
+   recent items) are the next clear chunk of CMM feature-parity work.
+3. The three deferred Track 1C minor items (`run_brew` timeout typing,
+   `time.time()` → `time.monotonic()` in copy-speed-test) are still just sitting
+   there — low priority, fine to bundle into whatever PR touches those functions
+   next rather than a dedicated pass.

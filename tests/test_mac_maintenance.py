@@ -66,6 +66,20 @@ def test_parse_ioreg_model_no_match_returns_none():
     assert model_number is None
 
 
+def test_default_orphans_skip_re_matches_real_folder_names():
+    m = load_module()
+    assert m.DEFAULT_ORPHANS_SKIP_RE.match("com.apple.Safari")
+    assert m.DEFAULT_ORPHANS_SKIP_RE.match("default.store")
+    assert not m.DEFAULT_ORPHANS_SKIP_RE.match("SomeRealApp")
+
+
+def test_human_size_kb_uses_appropriate_unit():
+    m = load_module()
+    assert m.human_size_kb(1) == "1 KB"
+    assert m.human_size_kb(2048) == "2.00 MB"
+    assert m.human_size_kb(2 * 1024 * 1024) == "2.00 GB"
+
+
 def test_parse_login_item_labels_matches_real_output():
     m = load_module()
     sample = '"io.mountainduck.loginitem" => enabled\ncom.apple.xpc.loginitemregisterd'
@@ -298,3 +312,155 @@ def test_generate_report_writes_files(tmp_path, monkeypatch):
     assert html_path.exists()
     css_path = html_path.with_suffix(".css")
     assert css_path.exists()
+
+
+def _set_mtime(path, age_seconds):
+    import os
+    import time
+    old_time = time.time() - age_seconds
+    os.utime(path, (old_time, old_time))
+
+
+def _touch_with_mtime(path, age_seconds, content="x"):
+    path.write_text(content)
+    _set_mtime(path, age_seconds)
+
+
+def test_clean_dir_contents_dry_run_keeps_files(home_tmp_path, capsys):
+    m = load_module()
+    target = home_tmp_path / "caches"
+    target.mkdir()
+    old_file = target / "stale.cache"
+    _touch_with_mtime(old_file, age_seconds=3600)
+
+    m._clean_dir_contents(target, m.MODE_DRY_RUN, "clean-caches", min_age_s=300.0)
+    assert old_file.exists()
+    out = capsys.readouterr().out
+    assert "would delete" in out
+    assert "stale.cache" in out
+
+
+def test_clean_dir_contents_skips_recently_modified_entries(home_tmp_path, capsys):
+    m = load_module()
+    target = home_tmp_path / "caches"
+    target.mkdir()
+    recent_file = target / "fresh.cache"
+    _touch_with_mtime(recent_file, age_seconds=1)
+
+    m._clean_dir_contents(target, m.MODE_APPLY, "clean-caches", min_age_s=300.0)
+    assert recent_file.exists()
+    out = capsys.readouterr().out
+    assert "skipped 1 recently-modified entry" in out
+
+
+def test_clean_dir_contents_apply_deletes_old_entries(home_tmp_path, capsys):
+    m = load_module()
+    target = home_tmp_path / "caches"
+    target.mkdir()
+    old_file = target / "stale.cache"
+    _touch_with_mtime(old_file, age_seconds=3600)
+
+    m._clean_dir_contents(target, m.MODE_APPLY, "clean-caches", min_age_s=300.0)
+    assert not old_file.exists()
+    out = capsys.readouterr().out
+    assert "deleted stale.cache" in out
+
+
+def test_task_clean_caches_uses_clean_caches_label(home_tmp_path, capsys):
+    m = load_module()
+    target = home_tmp_path / "Caches"
+    target.mkdir()
+    m.task_clean_caches(target, m.MODE_DRY_RUN, min_age_s=0.0)
+    out = capsys.readouterr().out
+    assert "clean-caches: nothing eligible" in out
+
+
+def test_task_empty_trash_uses_empty_trash_label(home_tmp_path, capsys):
+    m = load_module()
+    target = home_tmp_path / "Trash"
+    target.mkdir()
+    m.task_empty_trash(target, m.MODE_DRY_RUN)
+    out = capsys.readouterr().out
+    assert "empty-trash: nothing eligible" in out
+
+
+def test_task_clean_logs_uses_clean_logs_label(home_tmp_path, capsys):
+    m = load_module()
+    target = home_tmp_path / "Logs"
+    target.mkdir()
+    m.task_clean_logs(target, m.MODE_DRY_RUN, min_age_s=0.0)
+    out = capsys.readouterr().out
+    assert "clean-logs: nothing eligible" in out
+
+
+def test_clean_ios_backups_keeps_latest_n_dry_run(home_tmp_path, capsys):
+    m = load_module()
+    backups_dir = home_tmp_path / "Backup"
+    backups_dir.mkdir()
+    newest = backups_dir / "newest-uuid"
+    newest.mkdir()
+    _set_mtime(newest, age_seconds=10)
+    oldest = backups_dir / "oldest-uuid"
+    oldest.mkdir()
+    _set_mtime(oldest, age_seconds=999999)
+
+    m.task_clean_ios_backups(backups_dir, m.MODE_DRY_RUN, keep_latest=1)
+    out = capsys.readouterr().out
+    assert "keeping newest-uuid" in out
+    assert "would delete oldest-uuid" in out
+    assert newest.exists()
+    assert oldest.exists()
+
+
+def test_clean_ios_backups_rejects_keep_zero(home_tmp_path, capsys):
+    m = load_module()
+    backups_dir = home_tmp_path / "Backup"
+    backups_dir.mkdir()
+    (backups_dir / "some-uuid").mkdir()
+
+    m.task_clean_ios_backups(backups_dir, m.MODE_APPLY, keep_latest=0)
+    out = capsys.readouterr().out
+    assert "refusing to delete all backups" in out
+    assert (backups_dir / "some-uuid").exists()
+
+
+def test_installed_bundle_ids_reads_info_plist(tmp_path):
+    m = load_module()
+    apps_dir = tmp_path / "Applications"
+    apps_dir.mkdir()
+    contents_dir = apps_dir / "Slack.app" / "Contents"
+    contents_dir.mkdir(parents=True)
+    with (contents_dir / "Info.plist").open("wb") as f:
+        m.plistlib.dump({"CFBundleIdentifier": "com.tinyspeck.slackmacgap"}, f)
+
+    result = m.installed_bundle_ids(apps_dir)
+    assert result == {"com.tinyspeck.slackmacgap": "Slack"}
+
+
+def test_find_bundle_orphans_matches_exact_bundle_id(monkeypatch, tmp_path, capsys):
+    m = load_module()
+    apps_dir = tmp_path / "Applications"
+    apps_dir.mkdir()
+    contents_dir = apps_dir / "Slack.app" / "Contents"
+    contents_dir.mkdir(parents=True)
+    with (contents_dir / "Info.plist").open("wb") as f:
+        m.plistlib.dump({"CFBundleIdentifier": "com.tinyspeck.slackmacgap"}, f)
+
+    fake_home = tmp_path / "home"
+    containers = fake_home / "Library" / "Containers"
+    containers.mkdir(parents=True)
+    (containers / "com.tinyspeck.slackmacgap").mkdir()
+    (containers / "com.someoldapp.leftover").mkdir()
+    (containers / "com.apple.somesystemthing").mkdir()
+    (containers / "00F2F88D-E153-49FF-9C2D-87944A99BEE2").mkdir()
+    (containers / ".GlobalPreferences").mkdir()
+
+    monkeypatch.setattr(m.Path, "home", classmethod(lambda cls: fake_home))
+
+    m.task_find_bundle_orphans(apps_dir, limit=10)
+    out = capsys.readouterr().out
+    assert "containers/com.someoldapp.leftover" in out
+    assert "containers/com.tinyspeck.slackmacgap" not in out
+    assert "containers/com.apple.somesystemthing" not in out
+    assert "00F2F88D-E153-49FF-9C2D-87944A99BEE2" not in out
+    assert "containers/.GlobalPreferences" not in out
