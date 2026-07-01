@@ -46,6 +46,7 @@ TASK_SAFARI = "safari-cleanup"
 TASK_FIND_LAUNCH_AGENTS = "find-launch-agents"
 TASK_DISABLE_LOGIN_ITEM = "disable-login-item"
 TASK_DISABLE_LAUNCH_AGENT = "disable-launch-agent"
+TASK_SHOW_ACTIONS = "show-actions"
 
 DEFAULT_CACHE_MIN_AGE_SECONDS = 300.0
 DEFAULT_LOGS_MIN_AGE_SECONDS = 300.0
@@ -1416,6 +1417,120 @@ def du_kb(path: Path) -> Optional[int]:
         return None
 
 
+# ------------------------
+# Rollback facility: move-to-Trash + append-only action log
+# ------------------------
+
+# The path is passed ONLY as argv[0] — never interpolated into this script — so a
+# filename containing ", \, spaces, or unicode is treated as a literal path, not
+# JXA source (no injection). Both out-params are null and the failure throw is a
+# static string: dereferencing the NSError out-param segfaults osascript, whereas
+# this form exits 0 on success and 1 (with a stderr message) on failure.
+_TRASH_JXA = (
+    'function run(argv){var p=argv[0];ObjC.import("Foundation");'
+    'var fm=$.NSFileManager.defaultManager;var u=$.NSURL.fileURLWithPath(p);'
+    'if(!fm.trashItemAtURLResultingItemURLError(u,null,null)){'
+    'throw new Error("trash failed: "+p);}}'
+)
+
+
+def move_to_trash(path: Path) -> bool:
+    """Move a file or directory to the macOS Trash (recoverable via Finder 'Put
+    Back'). Returns True on success. On failure logs the reason and returns False
+    — the caller must NOT fall back to a permanent delete (a trash failure must
+    never become an unrecoverable delete)."""
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-l", "JavaScript", "-e", _TRASH_JXA, str(path)],
+            capture_output=True, text=True,
+        )
+    except Exception as e:
+        log(f"trash: failed to invoke osascript for {path}: {e}")
+        return False
+    if proc.returncode == 0:
+        return True
+    log(f"trash: could not move {path} to Trash: {proc.stderr.strip() or 'unknown error'}")
+    return False
+
+
+_ACTION_LOG_PATH: Optional[Path] = None
+_RUN_ID: str = ""
+
+
+def init_action_log(path: Path) -> None:
+    global _ACTION_LOG_PATH, _RUN_ID
+    _ACTION_LOG_PATH = path.expanduser()
+    _RUN_ID = dt.datetime.now().strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
+
+
+def log_action(*, task: str, action: str, path: str = "",
+               size_kb: Optional[int] = None, recoverable: bool = False,
+               recover_via: Optional[str] = None) -> None:
+    """Append one JSON record to the action log. No-op if the log wasn't
+    initialized. A write failure is logged but never aborts the caller. Callers
+    invoke this ONLY in apply mode, so dry-run/report never write the log."""
+    if _ACTION_LOG_PATH is None:
+        return
+    record = {
+        "ts": dt.datetime.now().isoformat(timespec="seconds"),
+        "run_id": _RUN_ID,
+        "task": task,
+        "action": action,
+        "path": path,
+        "size_kb": size_kb,
+        "recoverable": recoverable,
+        "recover_via": recover_via,
+        "mode": MODE_APPLY,
+    }
+    try:
+        parent = _ACTION_LOG_PATH.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(parent, 0o700)
+            except Exception:
+                pass
+        existed = _ACTION_LOG_PATH.exists()
+        with _ACTION_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        if not existed:
+            try:
+                os.chmod(_ACTION_LOG_PATH, 0o600)
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"action-log: failed to record {action} of {path}: {e}")
+
+
+def task_show_actions(run_id: Optional[str] = None) -> None:
+    if _ACTION_LOG_PATH is None or not _ACTION_LOG_PATH.exists():
+        log(f"show-actions: no action log at {_ACTION_LOG_PATH}")
+        return
+    shown = 0
+    try:
+        with _ACTION_LOG_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)  # tolerate a truncated final line
+                except Exception:
+                    continue
+                if run_id and rec.get("run_id") != run_id:
+                    continue
+                shown += 1
+                recov = rec.get("recover_via") or ("recoverable" if rec.get("recoverable") else "NOT recoverable")
+                log(f"  [{rec.get('ts')}] {rec.get('task')}: {rec.get('action')} "
+                    f"{rec.get('path')} — {recov}")
+    except Exception as e:
+        log(f"show-actions: failed to read {_ACTION_LOG_PATH}: {e}")
+        return
+    log(f"show-actions: {shown} action(s)"
+        + (f" for run {run_id}" if run_id else "")
+        + f" in {_ACTION_LOG_PATH}")
+
+
 def task_cleanup_archives(archive_dir: Path, mode: str) -> None:
     archive_dir = validate_home_path(archive_dir, "archive-dir")
     if not archive_dir.exists():
@@ -1699,7 +1814,8 @@ def close_app(name: str) -> bool:
 
 
 def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool,
-                        process_name: str = "Google Chrome Beta") -> None:
+                        process_name: str = "Google Chrome Beta",
+                        permanent: bool = False) -> None:
     chrome_dir = validate_home_path(chrome_dir, "chrome-dir")
     if not chrome_dir.exists():
         log(f"chrome-cleanup: directory not found: {chrome_dir}")
@@ -1732,31 +1848,40 @@ def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool,
         size_str = human_size_kb(size) if size else "unknown"
         log(f"  {profile}: {size_str}")
 
+    verb = "delete (permanent)" if permanent else "move to Trash"
     for profile in profiles:
         profile_path = chrome_dir / profile
         for name in CHROME_CLEAN_DIRS:
             dir_path = profile_path / name
             if not dir_path.is_dir():
                 continue
-            if mode == MODE_APPLY:
-                for root, dirs, files in os.walk(dir_path):
-                    for f in files:
-                        try:
-                            (Path(root) / f).unlink()
-                        except Exception as e:
-                            log(f"chrome-cleanup: failed to remove {Path(root) / f}: {e}")
-                    for d in dirs:
-                        try:
-                            shutil.rmtree(Path(root) / d, ignore_errors=True)
-                        except Exception as e:
-                            log(f"chrome-cleanup: failed to remove {Path(root) / d}: {e}")
-                log(f"cleaned: {profile}/{name}")
+            if mode != MODE_APPLY:
+                log(f"chrome-cleanup: would {verb}: {profile}/{name}")
+                continue
+            size = du_kb(dir_path)  # size BEFORE disposal
+            # Trash (or delete) the whole cache subdir wholesale — Chrome
+            # regenerates it. All-or-nothing: a locked file leaves the whole
+            # subdir untrashed (the safe failure), which move_to_trash logs.
+            try:
+                disposed = _dispose(dir_path, permanent)
+            except Exception as e:
+                log(f"chrome-cleanup: failed to remove {profile}/{name}: {e}")
+                continue
+            if not disposed:
+                continue
+            if permanent:
+                log(f"chrome-cleanup: deleted {profile}/{name}")
+                log_action(task="chrome-cleanup", action="deleted", path=str(dir_path),
+                           size_kb=size, recoverable=False)
             else:
-                log(f"would clean: {profile}/{name}")
+                log(f"chrome-cleanup: trashed {profile}/{name}")
+                log_action(task="chrome-cleanup", action="trashed", path=str(dir_path),
+                           size_kb=size, recoverable=True, recover_via="Finder → Trash → Put Back")
 
 
 def task_safari_cleanup(mode: str, kill_safari: bool, cache_dir: Path,
-                        favicon_dir: Path, website_data_dir: Path) -> None:
+                        favicon_dir: Path, website_data_dir: Path,
+                        permanent: bool = False) -> None:
     if process_running("Safari"):
         if not kill_safari:
             log("safari-cleanup: Safari is running. Use --kill-safari to close it.")
@@ -1778,10 +1903,24 @@ def task_safari_cleanup(mode: str, kill_safari: bool, cache_dir: Path,
     ]
     for sub, target in targets:
         _clean_dir_contents(target, mode, f"safari-cleanup:{sub}",
-                            min_age_s=DEFAULT_CACHE_MIN_AGE_SECONDS)
+                            min_age_s=DEFAULT_CACHE_MIN_AGE_SECONDS, permanent=permanent)
 
 
-def _clean_dir_contents(dir_path: Path, mode: str, label: str, min_age_s: float = 0.0) -> None:
+def _dispose(entry: Path, permanent: bool) -> bool:
+    """Delete or trash a single entry. Returns True if it was disposed of.
+    Permanent path unlinks/rmtrees; non-permanent moves to Trash and, on trash
+    failure, leaves the item in place (never falls back to a permanent delete)."""
+    if permanent:
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
+        return True
+    return move_to_trash(entry)
+
+
+def _clean_dir_contents(dir_path: Path, mode: str, label: str, min_age_s: float = 0.0,
+                        permanent: bool = False) -> None:
     dir_path = validate_home_path(dir_path, label)
     if not dir_path.is_dir():
         log(f"{label}: directory not found: {dir_path}")
@@ -1808,39 +1947,53 @@ def _clean_dir_contents(dir_path: Path, mode: str, label: str, min_age_s: float 
         log(f"{label}: nothing eligible for cleanup")
         return
 
+    verb = "delete (permanent)" if permanent else "move to Trash"
     total_kb = sum(du_kb(p) or 0 for p in eligible)
     log(f"{label}: {len(eligible)} entr{'y' if len(eligible) == 1 else 'ies'} eligible, "
         f"{human_size_kb(total_kb)} total")
 
     for entry in eligible:
-        size = du_kb(entry)
+        size = du_kb(entry)  # size BEFORE disposal (item is gone afterward)
         size_str = human_size_kb(size) if size else "unknown"
-        if mode == MODE_APPLY:
-            try:
-                if entry.is_symlink() or entry.is_file():
-                    entry.unlink()
-                else:
-                    shutil.rmtree(entry)
-                log(f"{label}: deleted {entry.name} ({size_str})")
-            except Exception as e:
-                log(f"{label}: failed to delete {entry.name}: {e}")
+        if mode != MODE_APPLY:
+            log(f"{label}: would {verb}: {entry.name} ({size_str})")
+            continue
+        try:
+            disposed = _dispose(entry, permanent)
+        except Exception as e:
+            log(f"{label}: failed to remove {entry.name}: {e}")
+            continue
+        if not disposed:
+            # move_to_trash already logged the reason; item left in place.
+            continue
+        if permanent:
+            log(f"{label}: deleted {entry.name} ({size_str})")
+            log_action(task=label, action="deleted", path=str(entry), size_kb=size,
+                       recoverable=False)
         else:
-            log(f"{label}: would delete {entry.name} ({size_str})")
+            log(f"{label}: trashed {entry.name} ({size_str})")
+            log_action(task=label, action="trashed", path=str(entry), size_kb=size,
+                       recoverable=True, recover_via="Finder → Trash → Put Back")
 
 
-def task_clean_caches(cache_dir: Path, mode: str, min_age_s: float = DEFAULT_CACHE_MIN_AGE_SECONDS) -> None:
-    _clean_dir_contents(cache_dir, mode, "clean-caches", min_age_s=min_age_s)
+def task_clean_caches(cache_dir: Path, mode: str, min_age_s: float = DEFAULT_CACHE_MIN_AGE_SECONDS,
+                      permanent: bool = False) -> None:
+    _clean_dir_contents(cache_dir, mode, "clean-caches", min_age_s=min_age_s, permanent=permanent)
 
 
 def task_empty_trash(trash_dir: Path, mode: str) -> None:
-    _clean_dir_contents(trash_dir, mode, "empty-trash", min_age_s=0.0)
+    # Hard-wired permanent: empty-trash IS the Trash — it must never try to
+    # move items already in ~/.Trash back into the Trash. Ignores --permanent.
+    _clean_dir_contents(trash_dir, mode, "empty-trash", min_age_s=0.0, permanent=True)
 
 
-def task_clean_logs(logs_dir: Path, mode: str, min_age_s: float = DEFAULT_LOGS_MIN_AGE_SECONDS) -> None:
-    _clean_dir_contents(logs_dir, mode, "clean-logs", min_age_s=min_age_s)
+def task_clean_logs(logs_dir: Path, mode: str, min_age_s: float = DEFAULT_LOGS_MIN_AGE_SECONDS,
+                    permanent: bool = False) -> None:
+    _clean_dir_contents(logs_dir, mode, "clean-logs", min_age_s=min_age_s, permanent=permanent)
 
 
-def task_clean_ios_backups(backups_dir: Path, mode: str, keep_latest: int = DEFAULT_IOS_BACKUPS_KEEP) -> None:
+def task_clean_ios_backups(backups_dir: Path, mode: str, keep_latest: int = DEFAULT_IOS_BACKUPS_KEEP,
+                           permanent: bool = False) -> None:
     backups_dir = validate_home_path(backups_dir, "ios-backups-dir")
     if not backups_dir.is_dir():
         log(f"clean-ios-backups: directory not found: {backups_dir}")
@@ -1876,17 +2029,28 @@ def task_clean_ios_backups(backups_dir: Path, mode: str, keep_latest: int = DEFA
     log(f"clean-ios-backups: {len(candidates)} backup(s) eligible for deletion, "
         f"{human_size_kb(total_kb)} total")
 
+    verb = "delete (permanent)" if permanent else "move to Trash"
     for p in candidates:
-        size = du_kb(p)
+        size = du_kb(p)  # size BEFORE disposal
         size_str = human_size_kb(size) if size else "unknown"
-        if mode == MODE_APPLY:
-            try:
-                shutil.rmtree(p)
-                log(f"clean-ios-backups: deleted {p.name} ({size_str})")
-            except Exception as e:
-                log(f"clean-ios-backups: failed to delete {p.name}: {e}")
+        if mode != MODE_APPLY:
+            log(f"clean-ios-backups: would {verb}: {p.name} ({size_str})")
+            continue
+        try:
+            disposed = _dispose(p, permanent)
+        except Exception as e:
+            log(f"clean-ios-backups: failed to remove {p.name}: {e}")
+            continue
+        if not disposed:
+            continue  # trash failed; move_to_trash logged it, backup left in place
+        if permanent:
+            log(f"clean-ios-backups: deleted {p.name} ({size_str})")
+            log_action(task="clean-ios-backups", action="deleted", path=str(p),
+                       size_kb=size, recoverable=False)
         else:
-            log(f"clean-ios-backups: would delete {p.name} ({size_str})")
+            log(f"clean-ios-backups: trashed {p.name} ({size_str})")
+            log_action(task="clean-ios-backups", action="trashed", path=str(p),
+                       size_kb=size, recoverable=True, recover_via="Finder → Trash → Put Back")
 
 
 def installed_bundle_ids(applications_dir: Path) -> Dict[str, str]:
@@ -2015,6 +2179,8 @@ def _disable_startup_item(label: str, mode: str, kind: str) -> None:
     )
     if proc.returncode == 0:
         log(f"{kind}: disabled {label} (undo with: launchctl enable {target})")
+        log_action(task=kind, action="disabled", path=label, recoverable=True,
+                   recover_via=f"launchctl enable {target}")
     else:
         log(f"{kind}: failed to disable {label}: {proc.stderr.strip()}")
 
@@ -2121,6 +2287,7 @@ def parse_args() -> argparse.Namespace:
             TASK_FIND_LAUNCH_AGENTS,
             TASK_DISABLE_LOGIN_ITEM,
             TASK_DISABLE_LAUNCH_AGENT,
+            TASK_SHOW_ACTIONS,
         ],
         help="Task to run (repeatable).",
     )
@@ -2191,6 +2358,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ios-backups-keep", type=int, default=DEFAULT_IOS_BACKUPS_KEEP)
 
+    # Rollback facility: deletions move to Trash by default (recoverable via Finder
+    # 'Put Back'); --permanent opts back into immediate unrecoverable deletion.
+    # empty-trash ignores --permanent (it is the Trash).
+    parser.add_argument("--permanent", action="store_true",
+                        help="Permanently delete instead of moving to Trash (unrecoverable).")
+    parser.add_argument("--action-log", default=str(Path.home() / ".mac-maintenance/actions.jsonl"),
+                        help="Append-only JSONL log of apply-mode actions (for audit / rollback).")
+    parser.add_argument("--run-id", default="",
+                        help="Filter show-actions to a single run id.")
+
     return parser.parse_args()
 
 
@@ -2198,6 +2375,11 @@ def main() -> int:
     args = parse_args()
     mode = args.mode
     tasks = args.task or []
+
+    # Sets the action-log path + a per-invocation run id. Does no I/O itself; the
+    # log file is created lazily on the first apply-mode write, so dry-run/report
+    # never touch it.
+    init_action_log(Path(args.action_log))
 
     if not tasks:
         if mode == MODE_REPORT:
@@ -2262,7 +2444,7 @@ def main() -> int:
 
     if TASK_CHROME in tasks:
         task_chrome_cleanup(Path(args.chrome_dir), mode, args.kill_chrome,
-                            process_name=args.chrome_process_name)
+                            process_name=args.chrome_process_name, permanent=args.permanent)
 
     if TASK_SAFARI in tasks:
         task_safari_cleanup(
@@ -2271,6 +2453,7 @@ def main() -> int:
             Path(args.safari_cache_dir),
             Path(args.safari_favicon_dir),
             Path(args.safari_website_data_dir),
+            permanent=args.permanent,
         )
 
     if TASK_FIND_LAUNCH_AGENTS in tasks:
@@ -2286,16 +2469,22 @@ def main() -> int:
         task_copy_speed_test(Path(args.copy_src), Path(args.copy_dst), mode)
 
     if TASK_CLEAN_CACHES in tasks:
-        task_clean_caches(Path(args.cache_dir), mode, min_age_s=args.cache_min_age)
+        task_clean_caches(Path(args.cache_dir), mode, min_age_s=args.cache_min_age,
+                          permanent=args.permanent)
 
     if TASK_EMPTY_TRASH in tasks:
         task_empty_trash(Path(args.trash_dir), mode)
 
     if TASK_CLEAN_LOGS in tasks:
-        task_clean_logs(Path(args.logs_dir), mode, min_age_s=args.logs_min_age)
+        task_clean_logs(Path(args.logs_dir), mode, min_age_s=args.logs_min_age,
+                        permanent=args.permanent)
 
     if TASK_CLEAN_IOS_BACKUPS in tasks:
-        task_clean_ios_backups(Path(args.ios_backups_dir), mode, keep_latest=args.ios_backups_keep)
+        task_clean_ios_backups(Path(args.ios_backups_dir), mode, keep_latest=args.ios_backups_keep,
+                               permanent=args.permanent)
+
+    if TASK_SHOW_ACTIONS in tasks:
+        task_show_actions(run_id=args.run_id or None)
 
     if TASK_FIND_BUNDLE_ORPHANS in tasks:
         task_find_bundle_orphans(Path(args.applications_dir), limit=args.orphans_limit)

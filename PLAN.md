@@ -274,18 +274,26 @@ deletions become recoverable rather than immediate — is confirmed regardless.
 | `empty-trash` | ❌ Permanent (by definition) |
 | `disable-*` | ✅ Already reversible (`launchctl enable`) |
 
-### Implementation scope (not yet built — awaiting go)
+### Implementation — ✅ DONE
 
-1. `move_to_trash(path) -> bool` helper wrapping the verified `osascript` JXA call;
-   log + return False on failure (never silently lose the caller's intent).
-2. `_clean_dir_contents`, `task_clean_ios_backups`, `task_chrome_cleanup`: route
-   the apply-mode delete through `move_to_trash` unless `--permanent`. For
-   `chrome-cleanup`, trash the whole named cache subdir rather than walking file
-   by file (fewer Trash items; Chrome regenerates the dir) — small, equivalent
-   behavior change to note in the PR.
-3. `--permanent` CLI flag; thread through the affected tasks. `empty-trash`
-   ignores it.
-4. Tests: assert non-permanent apply calls `move_to_trash` (monkeypatched) and
-   never `unlink`/`rmtree`; assert `--permanent` does the reverse; assert
-   `empty-trash` stays permanent regardless.
-5. Docs: README example + note; SDD §14 safety (recoverability); this file.
+Built after a two-round plan→review→revise loop (round 1: 2 Critical + 3 Major;
+round 2: confirmed resolved + caught the SCRIPT segfault, independently fixed).
+
+1. ✅ `move_to_trash(path) -> bool` — `osascript` JXA `trashItemAtURL`, path passed
+   only as argv (no injection), both out-params `null` + static-string throw (no
+   segfault), success=exit0/failure=exit1. Trash failure logs + returns False;
+   caller never falls back to a permanent delete.
+2. ✅ `_dispose(entry, permanent)` shared by `_clean_dir_contents`,
+   `task_clean_ios_backups`, `task_chrome_cleanup`. chrome-cleanup now trashes the
+   whole named cache subdir (Chrome regenerates it).
+3. ✅ `--permanent` flag threaded through the five recoverable tasks; `empty-trash`
+   hard-wired `permanent=True`.
+4. ✅ Append-only action log (`log_action`/`init_action_log`) at
+   `~/.mac-maintenance/actions.jsonl` (0o600), apply-mode only, size-before-disposal;
+   `--task show-actions` reads it (truncation-tolerant, `--run-id` filter).
+5. ✅ Auto-`rollback` deferred by design (Finder Put Back is the verified restore);
+   documented with the guards it would need.
+6. ✅ 48/48 tests pass (7 new incl. argv-injection, trash-vs-permanent,
+   trash-failure-no-fallback, empty-trash-always-permanent, show-actions). Verified
+   live: dry-run writes no log; apply moves to Trash + logs; show-actions reads back.
+7. ✅ Docs: README, SDD §11.17 + §14 + CLI list, this file.
