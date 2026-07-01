@@ -213,3 +213,79 @@ LaunchAgent discovery, and reversible login-item / launch-agent disabling.
    `time.time()` → `time.monotonic()` in copy-speed-test) are still just sitting
    there — low priority, fine to bundle into whatever PR touches those functions
    next rather than a dedicated pass.
+
+---
+
+## Track 3 — Backup & rollback for destructive tasks
+
+### Assessment (as of this review)
+
+Inventory of every destructive call and its reversibility **today**:
+
+| Task | Destructive op | Reversible today? |
+|---|---|---|
+| `disable-login-item` / `disable-launch-agent` | `launchctl disable` | ✅ Yes — `launchctl enable gui/$UID/<label>` (undo command printed in the log) |
+| `archive-orphans` | zip, then `rmtree` original | ✅ Effectively — the zip is the backup; unzip restores |
+| `cleanup-archives` | `unlink` expired zip | ⚠️ No — intended end-of-life for archives past their delete date; leaving as-is |
+| `clean-caches` | `unlink`/`rmtree` | ❌ No backup, no rollback |
+| `clean-logs` | `unlink`/`rmtree` | ❌ No backup, no rollback |
+| `empty-trash` | `unlink`/`rmtree` | ❌ No (and it *is* the Trash — permanent by definition) |
+| `chrome-cleanup` / `safari-cleanup` | `unlink`/`rmtree` | ❌ No backup, no rollback |
+| `clean-ios-backups` | `rmtree` | ❌ No — **highest-value / often-irreplaceable data in the tool** |
+
+**Gap:** six file-deletion tasks permanently delete with only dry-run as the
+safety net, and there is no `restore` command anywhere. `clean-ios-backups` is
+the sharpest risk (device backups may be the only copy of photos/messages).
+
+### Decision (confirmed with owner): move-to-Trash by default
+
+- The five recoverable deletion tasks — `clean-caches`, `clean-logs`,
+  `safari-cleanup`, `chrome-cleanup`, `clean-ios-backups` — move items to the
+  macOS Trash instead of `unlink`/`rmtree`. Rollback = recover from Trash
+  (drag out, or Finder "Put Back").
+- `empty-trash` is exempt (it *is* the Trash) and stays a permanent delete.
+- A new `--permanent` flag opts back into immediate `unlink`/`rmtree` for users
+  who want the space reclaimed now rather than on Trash-empty.
+- `cleanup-archives` / `archive-orphans` are unchanged — archive-orphans already
+  backs up (zip), and cleanup-archives only removes already-expired archives.
+
+### Verified mechanism (stdlib-only, consistent with existing architecture)
+
+`osascript -l JavaScript` → `NSFileManager.trashItemAtURLResultingItemURLError`.
+This is the same native trash API Finder uses; verified live on this machine —
+a probe file moved out of its origin into `~/.Trash` and was recoverable. Uses
+only `osascript`, a system binary the tool already shells out to (like `pgrep`,
+`du`, `launchctl`, `zip`), so it keeps the "no third-party deps / no PyObjC"
+constraint.
+
+**Honest caveat:** recovery-from-Trash is guaranteed (item is not destroyed
+until Trash is emptied). Finder's *"Put Back to exact original path"* is a Finder
+feature; `trashItemAtURL:` is the API Finder itself uses so it is expected to
+work, but a quick `mdls`/`xattr` probe did not positively confirm the put-back
+record (Finder stores it separately, not as an xattr). The substantive win —
+deletions become recoverable rather than immediate — is confirmed regardless.
+
+### Reversibility after Track 3 lands
+
+| Task | After Track 3 |
+|---|---|
+| `clean-caches` / `clean-logs` / `safari-cleanup` / `chrome-cleanup` | ✅ Recoverable from Trash (unless `--permanent`) |
+| `clean-ios-backups` | ✅ Recoverable from Trash (unless `--permanent`) |
+| `empty-trash` | ❌ Permanent (by definition) |
+| `disable-*` | ✅ Already reversible (`launchctl enable`) |
+
+### Implementation scope (not yet built — awaiting go)
+
+1. `move_to_trash(path) -> bool` helper wrapping the verified `osascript` JXA call;
+   log + return False on failure (never silently lose the caller's intent).
+2. `_clean_dir_contents`, `task_clean_ios_backups`, `task_chrome_cleanup`: route
+   the apply-mode delete through `move_to_trash` unless `--permanent`. For
+   `chrome-cleanup`, trash the whole named cache subdir rather than walking file
+   by file (fewer Trash items; Chrome regenerates the dir) — small, equivalent
+   behavior change to note in the PR.
+3. `--permanent` CLI flag; thread through the affected tasks. `empty-trash`
+   ignores it.
+4. Tests: assert non-permanent apply calls `move_to_trash` (monkeypatched) and
+   never `unlink`/`rmtree`; assert `--permanent` does the reverse; assert
+   `empty-trash` stays permanent regardless.
+5. Docs: README example + note; SDD §14 safety (recoverability); this file.
