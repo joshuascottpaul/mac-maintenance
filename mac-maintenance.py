@@ -42,6 +42,10 @@ TASK_EMPTY_TRASH = "empty-trash"
 TASK_CLEAN_LOGS = "clean-logs"
 TASK_CLEAN_IOS_BACKUPS = "clean-ios-backups"
 TASK_FIND_BUNDLE_ORPHANS = "find-bundle-orphans"
+TASK_SAFARI = "safari-cleanup"
+TASK_FIND_LAUNCH_AGENTS = "find-launch-agents"
+TASK_DISABLE_LOGIN_ITEM = "disable-login-item"
+TASK_DISABLE_LAUNCH_AGENT = "disable-launch-agent"
 
 DEFAULT_CACHE_MIN_AGE_SECONDS = 300.0
 DEFAULT_LOGS_MIN_AGE_SECONDS = 300.0
@@ -1670,40 +1674,41 @@ def task_brew_maintenance(
         run_brew(brew_bin, ["install", "--cask"] + missing_casks)
 
 
-def chrome_running() -> bool:
-    proc = subprocess.run(["/usr/bin/pgrep", "-f", "Google Chrome Beta"], capture_output=True)
+def process_running(name: str) -> bool:
+    proc = subprocess.run(["/usr/bin/pgrep", "-f", name], capture_output=True)
     return proc.returncode == 0
 
 
-def close_chrome() -> bool:
-    subprocess.run(["/usr/bin/osascript", "-e", 'quit app "Google Chrome Beta"'], capture_output=True)
+def close_app(name: str) -> bool:
+    subprocess.run(["/usr/bin/osascript", "-e", f'quit app "{name}"'], capture_output=True)
     time.sleep(3)
-    if not chrome_running():
+    if not process_running(name):
         return True
-    subprocess.run(["/usr/bin/pkill", "-TERM", "-f", "Google Chrome Beta"], capture_output=True)
+    subprocess.run(["/usr/bin/pkill", "-TERM", "-f", name], capture_output=True)
     time.sleep(5)
-    if not chrome_running():
+    if not process_running(name):
         return True
-    subprocess.run(["/usr/bin/pkill", "-KILL", "-f", "Google Chrome Beta"], capture_output=True)
+    subprocess.run(["/usr/bin/pkill", "-KILL", "-f", name], capture_output=True)
     time.sleep(2)
-    return not chrome_running()
+    return not process_running(name)
 
 
-def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool) -> None:
+def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool,
+                        process_name: str = "Google Chrome Beta") -> None:
     chrome_dir = validate_home_path(chrome_dir, "chrome-dir")
     if not chrome_dir.exists():
         log(f"chrome-cleanup: directory not found: {chrome_dir}")
         return
 
-    if chrome_running():
+    if process_running(process_name):
         if not kill_chrome:
-            log("chrome-cleanup: Chrome Beta is running. Use --kill-chrome to close it.")
+            log(f"chrome-cleanup: {process_name} is running. Use --kill-chrome to close it.")
             return
         if mode != MODE_APPLY:
-            log("chrome-cleanup: would close Chrome Beta")
+            log(f"chrome-cleanup: would close {process_name}")
             return
-        if not close_chrome():
-            log("chrome-cleanup: failed to close Chrome Beta")
+        if not close_app(process_name):
+            log(f"chrome-cleanup: failed to close {process_name}")
             return
 
     profiles = []
@@ -1743,6 +1748,28 @@ def task_chrome_cleanup(chrome_dir: Path, mode: str, kill_chrome: bool) -> None:
                 log(f"cleaned: {profile}/{name}")
             else:
                 log(f"would clean: {profile}/{name}")
+
+
+def task_safari_cleanup(mode: str, kill_safari: bool, cache_dir: Path,
+                        favicon_dir: Path, website_data_dir: Path) -> None:
+    if process_running("Safari"):
+        if not kill_safari:
+            log("safari-cleanup: Safari is running. Use --kill-safari to close it.")
+            return
+        if mode != MODE_APPLY:
+            log("safari-cleanup: would close Safari")
+            return
+        if not close_app("Safari"):
+            log("safari-cleanup: failed to close Safari")
+            return
+
+    targets = [
+        ("cache", cache_dir),
+        ("favicons", favicon_dir),
+        ("website-data", website_data_dir),
+    ]
+    for sub, target in targets:
+        _clean_dir_contents(target, mode, f"safari-cleanup:{sub}", min_age_s=0.0)
 
 
 def _clean_dir_contents(dir_path: Path, mode: str, label: str, min_age_s: float = 0.0) -> None:
@@ -1916,6 +1943,85 @@ def task_find_bundle_orphans(applications_dir: Path, limit: int) -> None:
             log(f"  {label}/{name} ({size_str})")
 
 
+def _launch_agent_loaded(uid: int, label: str) -> bool:
+    proc = subprocess.run(
+        ["/bin/launchctl", "print", f"gui/{uid}/{label}"],
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
+def task_find_launch_agents(agents_dir: Path) -> None:
+    agents_dir = agents_dir.expanduser().resolve()
+    if not agents_dir.is_dir():
+        log(f"find-launch-agents: directory not found: {agents_dir}")
+        return
+
+    uid = os.getuid()
+    plists = sorted(p for p in agents_dir.glob("*.plist"))
+    log(f"find-launch-agents: {len(plists)} plist(s) in {agents_dir}")
+    log("find-launch-agents: report-only — disable a specific one with "
+        "`--task disable-launch-agent --launch-agent <label>` (reversible via launchctl enable)")
+
+    for plist in plists:
+        try:
+            with plist.open("rb") as f:
+                data = plistlib.load(f)
+        except Exception as e:
+            log(f"  {plist.name}: failed to parse: {e}")
+            continue
+
+        label = data.get("Label") or plist.stem
+        program = data.get("Program")
+        if not program:
+            args = data.get("ProgramArguments")
+            if isinstance(args, list) and args:
+                program = args[0]
+        run_at_load = bool(data.get("RunAtLoad"))
+        loaded = _launch_agent_loaded(uid, label)
+
+        state_bits = []
+        state_bits.append("loaded" if loaded else "not-loaded")
+        if run_at_load:
+            state_bits.append("RunAtLoad")
+        log(f"  {label} [{', '.join(state_bits)}]")
+        if program:
+            log(f"      program: {program}")
+
+
+def _disable_startup_item(label: str, mode: str, kind: str) -> None:
+    uid = os.getuid()
+    target = f"gui/{uid}/{label}"
+    if mode != MODE_APPLY:
+        log(f"{kind}: would run launchctl disable {target}")
+        return
+    proc = subprocess.run(
+        ["/bin/launchctl", "disable", target],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        log(f"{kind}: disabled {label} (undo with: launchctl enable {target})")
+    else:
+        log(f"{kind}: failed to disable {label}: {proc.stderr.strip()}")
+
+
+def task_disable_login_item(labels: List[str], mode: str) -> None:
+    if not labels:
+        log("disable-login-item: no --login-item given, nothing to do")
+        return
+    for label in labels:
+        _disable_startup_item(label, mode, "disable-login-item")
+
+
+def task_disable_launch_agent(labels: List[str], mode: str) -> None:
+    if not labels:
+        log("disable-launch-agent: no --launch-agent given, nothing to do")
+        return
+    for label in labels:
+        _disable_startup_item(label, mode, "disable-launch-agent")
+
+
 def task_copy_speed_test(src: Path, dst: Path, mode: str) -> None:
     if not str(src) or not str(dst):
         log("copy-speed-test: --copy-src and --copy-dst are required for this task")
@@ -1998,6 +2104,10 @@ def parse_args() -> argparse.Namespace:
             TASK_CLEAN_LOGS,
             TASK_CLEAN_IOS_BACKUPS,
             TASK_FIND_BUNDLE_ORPHANS,
+            TASK_SAFARI,
+            TASK_FIND_LAUNCH_AGENTS,
+            TASK_DISABLE_LOGIN_ITEM,
+            TASK_DISABLE_LAUNCH_AGENT,
         ],
         help="Task to run (repeatable).",
     )
@@ -2037,6 +2147,19 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--chrome-dir", default=str(Path.home() / "Library/Application Support/Google/Chrome Beta"))
     parser.add_argument("--kill-chrome", action="store_true")
+    parser.add_argument("--chrome-process-name", default="Google Chrome Beta")
+
+    parser.add_argument("--safari-cache-dir", default=str(Path.home() / "Library/Caches/com.apple.Safari"))
+    parser.add_argument("--safari-favicon-dir", default=str(Path.home() / "Library/Safari/Favicon Cache"))
+    parser.add_argument(
+        "--safari-website-data-dir",
+        default=str(Path.home() / "Library/WebKit/com.apple.Safari/WebsiteData"),
+    )
+    parser.add_argument("--kill-safari", action="store_true")
+
+    parser.add_argument("--launch-agents-dir", default=str(Path.home() / "Library/LaunchAgents"))
+    parser.add_argument("--login-item", action="append", default=[])
+    parser.add_argument("--launch-agent", action="append", default=[])
 
     parser.add_argument("--copy-src", default="")
     parser.add_argument("--copy-dst", default="")
@@ -2125,7 +2248,26 @@ def main() -> int:
         task_cleanup_archives(Path(args.archive_dir), mode)
 
     if TASK_CHROME in tasks:
-        task_chrome_cleanup(Path(args.chrome_dir), mode, args.kill_chrome)
+        task_chrome_cleanup(Path(args.chrome_dir), mode, args.kill_chrome,
+                            process_name=args.chrome_process_name)
+
+    if TASK_SAFARI in tasks:
+        task_safari_cleanup(
+            mode,
+            args.kill_safari,
+            Path(args.safari_cache_dir),
+            Path(args.safari_favicon_dir),
+            Path(args.safari_website_data_dir),
+        )
+
+    if TASK_FIND_LAUNCH_AGENTS in tasks:
+        task_find_launch_agents(Path(args.launch_agents_dir))
+
+    if TASK_DISABLE_LOGIN_ITEM in tasks:
+        task_disable_login_item(args.login_item, mode)
+
+    if TASK_DISABLE_LAUNCH_AGENT in tasks:
+        task_disable_launch_agent(args.launch_agent, mode)
 
     if TASK_COPY in tasks:
         task_copy_speed_test(Path(args.copy_src), Path(args.copy_dst), mode)

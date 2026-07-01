@@ -234,6 +234,43 @@ Mode behavior rules.
   their parent app, so they appear as "orphans" even when legitimate. The tool
   logs this caveat and defers all deletion decisions to manual review.
 
+**11.13 `chrome-cleanup` (multi-channel)**
+
+- Generalized beyond Chrome Beta: the process name to detect/quit is a parameter
+  (`--chrome-process-name`, default `Google Chrome Beta`), so pointing
+  `--chrome-dir` at stable Chrome plus `--chrome-process-name "Google Chrome"`
+  cleans the stable channel with no new task.
+- Shared helpers `process_running(name)` / `close_app(name)` back both this task
+  and `safari-cleanup`.
+
+**11.14 `safari-cleanup`**
+
+- Clears cache and per-site WebKit data only: `--safari-cache-dir`
+  (`~/Library/Caches/com.apple.Safari`), `--safari-favicon-dir`
+  (`~/Library/Safari/Favicon Cache`), `--safari-website-data-dir`
+  (`~/Library/WebKit/com.apple.Safari/WebsiteData`).
+- Deliberately does **not** touch `History.db`, `Bookmarks.plist`, or the shared
+  `~/Library/Cookies/Cookies.binarycookies` (shared across all WebKit apps).
+- Refuses to act while Safari is running unless `--kill-safari` is given; reuses
+  `_clean_dir_contents` for each target.
+
+**11.15 `find-launch-agents`**
+
+- Report-only. Parses `~/Library/LaunchAgents/*.plist` (`--launch-agents-dir`) via
+  `plistlib`, printing each `Label`, its `Program`/first `ProgramArguments` entry,
+  `RunAtLoad`, and current loaded state (from `launchctl print gui/$UID/<label>`).
+- Malformed plists are logged and skipped, never fatal.
+
+**11.16 `disable-login-item` / `disable-launch-agent`**
+
+- Both call one `_disable_startup_item(label, mode, kind)` helper that runs
+  `launchctl disable gui/$UID/<label>` — the identical, persistent, reversible
+  mechanism for ServiceManagement login items and classic LaunchAgents.
+- Never auto-acts: the user must name each label explicitly via repeatable
+  `--login-item` / `--launch-agent` flags (like `archive-orphans` requires an
+  explicit `--archive-folder` list). No labels given → "nothing to do".
+- Reversal (`launchctl enable gui/$UID/<label>`) is printed in the success log.
+
 ---
 
 **12. Data Model**
@@ -289,10 +326,21 @@ Orphan and archive parameters.
 - `--archive-days`
 - `--archive-folder`
 
-Chrome parameters.
+Browser parameters.
 
 - `--chrome-dir`
 - `--kill-chrome`
+- `--chrome-process-name`
+- `--safari-cache-dir`
+- `--safari-favicon-dir`
+- `--safari-website-data-dir`
+- `--kill-safari`
+
+Startup-item parameters.
+
+- `--launch-agents-dir`
+- `--login-item` (repeatable)
+- `--launch-agent` (repeatable)
 
 Copy parameters.
 
@@ -317,7 +365,10 @@ Cache, trash, logs, and iOS backup parameters.
 - All deletions are explicit and constrained to validated paths.
 - Home directory validation is enforced for user-writable targets.
 - Brew binary path is validated and requires an absolute executable path.
-- Chrome cleanup is scoped to expected profile directory.
+- Chrome/Safari cleanup is scoped to expected profile/cache directories.
+- Startup-item disabling uses `launchctl disable`, which is persistent but fully
+  reversible via `launchctl enable gui/$UID/<label>` (printed in the success log).
+  The tool never auto-disables — each label must be named explicitly.
 - Network operations are opt-in.
 
 ---
@@ -366,10 +417,14 @@ Cache, trash, logs, and iOS backup parameters.
 - `pytest` suite in `tests/test_mac_maintenance.py` covers path validation, regex-based
   parsing (hardware model, login items, orphan skip-list), mode-gating (dry-run/report
   never write or delete), age-guarded content deletion (caches/trash/logs), iOS backup
-  retention, bundle-ID extraction and matching, and report generation.
+  retention, bundle-ID extraction and matching, process detection, Safari/Chrome
+  cleanup branching, LaunchAgent plist parsing, `launchctl disable` invocation
+  (mocked — never run for real), and report generation.
+- All process-control and `launchctl` calls are monkeypatched in tests; no test ever
+  quits an app or disables a real startup item.
 - Manual dry-run validation of each task.
-- Manual report-only run of `find-bundle-orphans` against the real machine to sanity
-  check noise levels before considering any deletion feature on top of it.
+- Manual report-only run of `find-bundle-orphans` / `find-launch-agents` against the
+  real machine to sanity check output before acting.
 - Report generation smoke test.
 
 ---

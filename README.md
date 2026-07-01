@@ -40,7 +40,9 @@ cd mac-maintenance-darwin-arm64
 - HTML + CSS report generation
 - Safe defaults and explicit action flags
 - Disk cleanup: caches, Trash, logs, iOS backups (age-guarded, dry-run by default)
+- Browser cleanup: any Chromium channel (Beta/stable/other) plus Safari cache + site data
 - Bundle-ID-based orphan detection across Containers/Preferences/Saved State/App Scripts (report-only)
+- Startup-item control: list LaunchAgents, disable login items / launch agents (reversible)
 - Pytest suite for core behaviors
 
 ## Quick Start
@@ -73,6 +75,24 @@ Find potential app leftovers by bundle ID (report-only, no deletion):
 
 ```bash
 python3 mac-maintenance.py --mode report --task find-bundle-orphans
+```
+
+Clean stable Chrome (not just Beta) and Safari caches (dry-run):
+
+```bash
+python3 mac-maintenance.py --mode dry-run --task chrome-cleanup \
+  --chrome-dir "$HOME/Library/Application Support/Google/Chrome" \
+  --chrome-process-name "Google Chrome"
+python3 mac-maintenance.py --mode dry-run --task safari-cleanup
+```
+
+List startup LaunchAgents (report-only), then disable a specific one (reversible):
+
+```bash
+python3 mac-maintenance.py --mode report --task find-launch-agents
+python3 mac-maintenance.py --mode apply --task disable-launch-agent --launch-agent com.example.updater
+python3 mac-maintenance.py --mode apply --task disable-login-item --login-item com.example.helper.loginitem
+# undo with: launchctl enable gui/$UID/<label>
 ```
 
 ## Tests

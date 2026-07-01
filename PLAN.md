@@ -138,13 +138,27 @@ plan as written.
   surfaces. Do this only after living with the report output for a while and
   confirming the false-positive rate is tolerable for your own machine.
 
-### 2D. Stretch goals (still open)
+### 2D. Stretch goals
 
-- [ ] Login items: add `--task disable-login-item <label>` (currently report-only)
-- [ ] Launch agents: add `--task disable-launch-agent <label>`
-- [ ] Browser history/cookies: extend beyond Chrome Beta to stable Chrome, Safari, Firefox
-- [ ] Recent items: clear `NSRecentDocuments` plists
-- [ ] 2C deletion wiring (see above)
+- [x] **Login items**: `--task disable-login-item --login-item <label>` (repeatable).
+- [x] **Launch agents**: `--task disable-launch-agent --launch-agent <label>`
+  (repeatable), plus a new report-only `--task find-launch-agents` that parses
+  `~/Library/LaunchAgents/*.plist` and shows Label/Program/RunAtLoad/loaded state.
+  Both disable tasks share one `_disable_startup_item()` helper running
+  `launchctl disable gui/$UID/<label>` (reversible via `launchctl enable`); never
+  auto-acts — labels must be named explicitly.
+- [x] **Browsers**: generalized `chrome-cleanup` to any Chromium channel via
+  `--chrome-process-name` (default still Chrome Beta, so existing behavior
+  unchanged); point `--chrome-dir` at stable Chrome + `--chrome-process-name
+  "Google Chrome"`. New `safari-cleanup` clears Safari cache + favicon +
+  per-site WebKit data only — deliberately **not** History.db, Bookmarks, or the
+  shared Cookies.binarycookies.
+- [ ] **Firefox**: not done — Firefox uses a different profile/cache layout
+  (`~/Library/Application Support/Firefox/Profiles/*`, `~/Library/Caches/Firefox`);
+  deferred as a separate follow-up.
+- [ ] **Recent items**: clear `NSRecentDocuments` plists — still open.
+- [ ] **2C deletion wiring** (see above) — still deferred pending real-world
+  false-positive assessment.
 
 ---
 
@@ -172,14 +186,30 @@ and Logs cleanup (CMM's highest-volume disk-recovery actions) now exist with
 dry-run-by-default safety. App-leftover detection is now bundle-ID-accurate
 instead of fuzzy-matched, though still report-only.
 
+---
+
+## Re-run verdict — Track 2D (browsers + startup items) complete
+
+Confirmed by 38/38 passing tests plus live smoke tests: `find-launch-agents`
+ran read-only against the real machine (parsed 23 plists, gracefully skipped one
+genuinely malformed plist without crashing), stable-Chrome `chrome-cleanup`
+dry-run found the real Default profile via `--chrome-process-name "Google
+Chrome"`, `safari-cleanup` dry-run correctly detected Safari running and bailed,
+and `disable-launch-agent` dry-run printed the exact `launchctl disable` command
+without executing it. All destructive/process-control paths are monkeypatched in
+tests — no test quits an app or disables a real startup item.
+
+Shipped: multi-channel Chromium cleanup, Safari cache/site-data cleanup,
+LaunchAgent discovery, and reversible login-item / launch-agent disabling.
+
 ## Recommended next action
 
 1. **Live with `find-bundle-orphans` for a while** before wiring up deletion for
    it — the false-positive rate from helper-tool/Team-ID bundle IDs is real and
    disclosed; deleting based on it today would be premature.
-2. **2D stretch goals** (login item / launch agent disable, multi-browser privacy,
-   recent items) are the next clear chunk of CMM feature-parity work.
-3. The three deferred Track 1C minor items (`run_brew` timeout typing,
+2. **Remaining 2D**: Firefox cleanup (different profile/cache layout) and
+   `NSRecentDocuments` recent-items clearing.
+3. The two deferred Track 1C minor items (`run_brew` timeout typing,
    `time.time()` → `time.monotonic()` in copy-speed-test) are still just sitting
    there — low priority, fine to bundle into whatever PR touches those functions
    next rather than a dedicated pass.
