@@ -476,7 +476,8 @@ def test_process_running_reads_pgrep_returncode(monkeypatch):
 
     monkeypatch.setattr(m.subprocess, "run", fake_run)
     assert m.process_running("Some App") is True
-    assert calls == [["/usr/bin/pgrep", "-f", "Some App"]]
+    # -x (exact name match), NOT -f (command-line substring) — see process_running docstring.
+    assert calls == [["/usr/bin/pgrep", "-x", "Some App"]]
 
 
 def test_process_running_false_when_pgrep_nonzero(monkeypatch):
@@ -486,6 +487,28 @@ def test_process_running_false_when_pgrep_nonzero(monkeypatch):
         lambda argv, **_k: subprocess.CompletedProcess(argv, 1),
     )
     assert m.process_running("Nope") is False
+
+
+def test_close_app_uses_exact_match_pkill(monkeypatch):
+    m = load_module()
+    calls = []
+
+    def fake_run(argv, **_k):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m.time, "sleep", lambda _s: None)
+    # Report still-running after every attempt so both pkill fallbacks fire.
+    monkeypatch.setattr(m, "process_running", lambda name: True)
+
+    result = m.close_app("Safari")
+    assert result is False  # still running after KILL
+    # osascript quit first, then TERM and KILL both with -x (exact), never -f.
+    assert calls[0][:2] == ["/usr/bin/osascript", "-e"]
+    assert ["/usr/bin/pkill", "-TERM", "-x", "Safari"] in calls
+    assert ["/usr/bin/pkill", "-KILL", "-x", "Safari"] in calls
+    assert not any("-f" in c for c in calls)
 
 
 def test_chrome_cleanup_uses_custom_process_name(monkeypatch, home_tmp_path, capsys):
@@ -534,6 +557,27 @@ def test_safari_cleanup_running_no_kill_bails(monkeypatch, home_tmp_path, capsys
     assert "nothing eligible" not in out
 
 
+def test_safari_cleanup_kill_then_clean(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    monkeypatch.setattr(m, "process_running", lambda name: True)
+    close_calls = []
+    monkeypatch.setattr(m, "close_app", lambda name: close_calls.append(name) or True)
+
+    cache = home_tmp_path / "cache"
+    fav = home_tmp_path / "fav"
+    web = home_tmp_path / "web"
+    for d in (cache, fav, web):
+        d.mkdir()
+
+    # Running + --kill-safari + apply: should close Safari, then visit all three targets.
+    m.task_safari_cleanup(m.MODE_APPLY, True, cache, fav, web)
+    out = capsys.readouterr().out
+    assert close_calls == ["Safari"]
+    assert "safari-cleanup:cache: nothing eligible" in out
+    assert "safari-cleanup:favicons: nothing eligible" in out
+    assert "safari-cleanup:website-data: nothing eligible" in out
+
+
 def test_find_launch_agents_reports_label_and_program(monkeypatch, tmp_path, capsys):
     m = load_module()
     agents = tmp_path / "LaunchAgents"
@@ -554,6 +598,24 @@ def test_find_launch_agents_reports_label_and_program(monkeypatch, tmp_path, cap
     assert "com.example.updater" in out
     assert "RunAtLoad" in out
     assert "/usr/local/bin/updater" in out
+
+
+def test_find_launch_agents_survives_nondict_and_missing_fields(monkeypatch, tmp_path, capsys):
+    m = load_module()
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    # Valid plist whose root is an array, not a dict — must not crash the task.
+    with (agents / "com.bad.array.plist").open("wb") as f:
+        m.plistlib.dump(["not", "a", "dict"], f)
+    # Valid dict plist with no Label, no Program, no ProgramArguments — falls back to stem.
+    with (agents / "com.bare.noprogram.plist").open("wb") as f:
+        m.plistlib.dump({"RunAtLoad": False}, f)
+    monkeypatch.setattr(m, "_launch_agent_loaded", lambda uid, label: False)
+
+    m.task_find_launch_agents(agents)  # must not raise
+    out = capsys.readouterr().out
+    assert "com.bad.array" in out and "not a dict" in out
+    assert "com.bare.noprogram" in out  # label falls back to plist stem
 
 
 def test_disable_startup_item_dry_run_does_not_call_launchctl(monkeypatch, capsys):

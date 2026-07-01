@@ -241,7 +241,14 @@ Mode behavior rules.
   `--chrome-dir` at stable Chrome plus `--chrome-process-name "Google Chrome"`
   cleans the stable channel with no new task.
 - Shared helpers `process_running(name)` / `close_app(name)` back both this task
-  and `safari-cleanup`.
+  and `safari-cleanup`. Both use `pgrep -x` / `pkill -x` (exact executable-name
+  match), **not** `-f` (command-line substring). `-f` would match helper and XPC
+  processes and unrelated commands (e.g. `pgrep -f Safari` matches ~20 processes
+  including `1Password for Safari` and the `com.apple.Safari.*` helpers), causing
+  both false "still running" guards and — via `pkill` — collateral kills. `-x`
+  matches only the browser process itself; macOS `pgrep -x` matches the full name
+  (no 15-char `comm` truncation), so multi-word names like `Google Chrome Beta`
+  work.
 
 **11.14 `safari-cleanup`**
 
@@ -252,14 +259,17 @@ Mode behavior rules.
 - Deliberately does **not** touch `History.db`, `Bookmarks.plist`, or the shared
   `~/Library/Cookies/Cookies.binarycookies` (shared across all WebKit apps).
 - Refuses to act while Safari is running unless `--kill-safari` is given; reuses
-  `_clean_dir_contents` for each target.
+  `_clean_dir_contents` for each target, with the same `DEFAULT_CACHE_MIN_AGE_SECONDS`
+  age guard as `clean-caches` (Safari's XPC helpers keep writing after the main
+  app quits, so skip anything touched in the last few minutes).
 
 **11.15 `find-launch-agents`**
 
 - Report-only. Parses `~/Library/LaunchAgents/*.plist` (`--launch-agents-dir`) via
   `plistlib`, printing each `Label`, its `Program`/first `ProgramArguments` entry,
   `RunAtLoad`, and current loaded state (from `launchctl print gui/$UID/<label>`).
-- Malformed plists are logged and skipped, never fatal.
+- Malformed plists (and valid plists whose root is not a dict) are logged and
+  skipped, never fatal — one bad file can't abort the task or the run.
 
 **11.16 `disable-login-item` / `disable-launch-agent`**
 

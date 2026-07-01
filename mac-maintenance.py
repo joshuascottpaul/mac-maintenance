@@ -1675,7 +1675,12 @@ def task_brew_maintenance(
 
 
 def process_running(name: str) -> bool:
-    proc = subprocess.run(["/usr/bin/pgrep", "-f", name], capture_output=True)
+    # -x matches the exact executable name, NOT a command-line substring. This is
+    # deliberate: `pgrep -f Safari` also matches SafariBookmarksSyncAgent, the
+    # com.apple.Safari.* XPC helpers, "1Password for Safari", and any unrelated
+    # process with "Safari" in its argv — so -f would both false-positive the
+    # "is it running?" guard and (via pkill) kill bystander processes.
+    proc = subprocess.run(["/usr/bin/pgrep", "-x", name], capture_output=True)
     return proc.returncode == 0
 
 
@@ -1684,11 +1689,11 @@ def close_app(name: str) -> bool:
     time.sleep(3)
     if not process_running(name):
         return True
-    subprocess.run(["/usr/bin/pkill", "-TERM", "-f", name], capture_output=True)
+    subprocess.run(["/usr/bin/pkill", "-TERM", "-x", name], capture_output=True)
     time.sleep(5)
     if not process_running(name):
         return True
-    subprocess.run(["/usr/bin/pkill", "-KILL", "-f", name], capture_output=True)
+    subprocess.run(["/usr/bin/pkill", "-KILL", "-x", name], capture_output=True)
     time.sleep(2)
     return not process_running(name)
 
@@ -1763,13 +1768,17 @@ def task_safari_cleanup(mode: str, kill_safari: bool, cache_dir: Path,
             log("safari-cleanup: failed to close Safari")
             return
 
+    # Same age guard as clean-caches: Safari's own XPC helpers (search, safe-browsing,
+    # extension hosts) keep running and writing even after the main app quits, so skip
+    # anything touched in the last few minutes to avoid deleting a file mid-write.
     targets = [
         ("cache", cache_dir),
         ("favicons", favicon_dir),
         ("website-data", website_data_dir),
     ]
     for sub, target in targets:
-        _clean_dir_contents(target, mode, f"safari-cleanup:{sub}", min_age_s=0.0)
+        _clean_dir_contents(target, mode, f"safari-cleanup:{sub}",
+                            min_age_s=DEFAULT_CACHE_MIN_AGE_SECONDS)
 
 
 def _clean_dir_contents(dir_path: Path, mode: str, label: str, min_age_s: float = 0.0) -> None:
@@ -1969,6 +1978,10 @@ def task_find_launch_agents(agents_dir: Path) -> None:
                 data = plistlib.load(f)
         except Exception as e:
             log(f"  {plist.name}: failed to parse: {e}")
+            continue
+
+        if not isinstance(data, dict):
+            log(f"  {plist.name}: skipping (root is {type(data).__name__}, not a dict)")
             continue
 
         label = data.get("Label") or plist.stem
