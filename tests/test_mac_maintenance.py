@@ -336,7 +336,7 @@ def test_clean_dir_contents_dry_run_keeps_files(home_tmp_path, capsys):
     m._clean_dir_contents(target, m.MODE_DRY_RUN, "clean-caches", min_age_s=300.0)
     assert old_file.exists()
     out = capsys.readouterr().out
-    assert "would delete" in out
+    assert "would move to Trash" in out
     assert "stale.cache" in out
 
 
@@ -353,17 +353,66 @@ def test_clean_dir_contents_skips_recently_modified_entries(home_tmp_path, capsy
     assert "skipped 1 recently-modified entry" in out
 
 
-def test_clean_dir_contents_apply_deletes_old_entries(home_tmp_path, capsys):
+def test_clean_dir_contents_apply_default_moves_to_trash(monkeypatch, home_tmp_path, capsys):
     m = load_module()
+    m.init_action_log(home_tmp_path / "actions.jsonl")
+    trashed = []
+    # Stub move_to_trash: records the call and returns success WITHOUT removing the
+    # file. So if the file is still present after apply mode, no permanent delete
+    # (unlink/rmtree) happened — proving the default routes through Trash only.
+    monkeypatch.setattr(m, "move_to_trash", lambda p: trashed.append(p) or True)
+
     target = home_tmp_path / "caches"
     target.mkdir()
     old_file = target / "stale.cache"
     _touch_with_mtime(old_file, age_seconds=3600)
 
-    m._clean_dir_contents(target, m.MODE_APPLY, "clean-caches", min_age_s=300.0)
+    m._clean_dir_contents(target, m.MODE_APPLY, "clean-caches", min_age_s=300.0, permanent=False)
+    assert trashed == [old_file]
+    assert old_file.exists()  # move_to_trash was the only disposal path; no unlink/rmtree
+    out = capsys.readouterr().out
+    assert "trashed stale.cache" in out
+    import json
+    recs = [json.loads(l) for l in (home_tmp_path / "actions.jsonl").read_text().splitlines()]
+    assert len(recs) == 1 and recs[0]["action"] == "trashed" and recs[0]["recoverable"] is True
+
+
+def test_clean_dir_contents_apply_permanent_unlinks(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    m.init_action_log(home_tmp_path / "actions.jsonl")
+    monkeypatch.setattr(m, "move_to_trash",
+                        lambda p: (_ for _ in ()).throw(AssertionError("move_to_trash called in --permanent")))
+
+    target = home_tmp_path / "caches"
+    target.mkdir()
+    old_file = target / "stale.cache"
+    _touch_with_mtime(old_file, age_seconds=3600)
+
+    m._clean_dir_contents(target, m.MODE_APPLY, "clean-caches", min_age_s=300.0, permanent=True)
     assert not old_file.exists()
     out = capsys.readouterr().out
     assert "deleted stale.cache" in out
+    import json
+    recs = [json.loads(l) for l in (home_tmp_path / "actions.jsonl").read_text().splitlines()]
+    assert recs[0]["action"] == "deleted" and recs[0]["recoverable"] is False
+
+
+def test_clean_dir_contents_trash_failure_leaves_item(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    m.init_action_log(home_tmp_path / "actions.jsonl")
+    monkeypatch.setattr(m, "move_to_trash", lambda p: False)  # trash fails
+
+    target = home_tmp_path / "caches"
+    target.mkdir()
+    old_file = target / "stale.cache"
+    _touch_with_mtime(old_file, age_seconds=3600)
+
+    # If there were a fallback unlink/rmtree on trash failure, the file would be
+    # gone. It must remain — a trash failure never becomes a permanent delete.
+    m._clean_dir_contents(target, m.MODE_APPLY, "clean-caches", min_age_s=300.0, permanent=False)
+    assert old_file.exists()
+    log_path = home_tmp_path / "actions.jsonl"
+    assert (not log_path.exists()) or log_path.read_text().strip() == ""
 
 
 def test_task_clean_caches_uses_clean_caches_label(home_tmp_path, capsys):
@@ -407,7 +456,7 @@ def test_clean_ios_backups_keeps_latest_n_dry_run(home_tmp_path, capsys):
     m.task_clean_ios_backups(backups_dir, m.MODE_DRY_RUN, keep_latest=1)
     out = capsys.readouterr().out
     assert "keeping newest-uuid" in out
-    assert "would delete oldest-uuid" in out
+    assert "would move to Trash: oldest-uuid" in out
     assert newest.exists()
     assert oldest.exists()
 
@@ -681,3 +730,87 @@ def test_disable_launch_agent_nothing_to_do(monkeypatch, capsys):
     m.task_disable_launch_agent([], m.MODE_APPLY)
     out = capsys.readouterr().out
     assert "nothing to do" in out
+
+
+def test_move_to_trash_passes_path_as_argv_not_interpolated(monkeypatch):
+    m = load_module()
+    seen = {}
+
+    def fake_run(argv, **_k):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    tricky = Path('/Users/x/Library/Caches/we"ird ") ; throw 1')
+    expected = str(tricky)  # Path normalizes; compare against the normalized form
+    assert m.move_to_trash(tricky) is True
+    argv = seen["argv"]
+    # The path must be the LAST argv element, never embedded in the -e SCRIPT.
+    assert argv[-1] == expected
+    assert argv[:4] == ["/usr/bin/osascript", "-l", "JavaScript", "-e"]
+    assert 'we"ird' not in argv[4]  # the SCRIPT string does not contain the path/quotes
+
+
+def test_move_to_trash_failure_returns_false_and_logs(monkeypatch, capsys):
+    m = load_module()
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="trash failed: /x (-2700)"),
+    )
+    assert m.move_to_trash(Path("/x")) is False
+    assert "could not move" in capsys.readouterr().out
+
+
+def test_empty_trash_is_always_permanent(monkeypatch, home_tmp_path, capsys):
+    m = load_module()
+    m.init_action_log(home_tmp_path / "actions.jsonl")
+    # empty-trash must NEVER move-to-trash (it IS the Trash), even absent --permanent.
+    monkeypatch.setattr(m, "move_to_trash",
+                        lambda p: (_ for _ in ()).throw(AssertionError("empty-trash must not move_to_trash")))
+    trash = home_tmp_path / "Trash"
+    trash.mkdir()
+    (trash / "junk.txt").write_text("x")
+
+    m.task_empty_trash(trash, m.MODE_APPLY)
+    assert not (trash / "junk.txt").exists()  # permanently removed
+    import json
+    recs = [json.loads(l) for l in (home_tmp_path / "actions.jsonl").read_text().splitlines()]
+    assert recs[0]["action"] == "deleted" and recs[0]["recoverable"] is False
+
+
+def test_show_actions_prints_records_and_tolerates_truncation(home_tmp_path, capsys):
+    m = load_module()
+    log_path = home_tmp_path / "actions.jsonl"
+    import json
+    with log_path.open("w") as f:
+        f.write(json.dumps({"ts": "T1", "run_id": "r1", "task": "clean-caches",
+                            "action": "trashed", "path": "/a", "recoverable": True,
+                            "recover_via": "Finder → Trash → Put Back"}) + "\n")
+        f.write(json.dumps({"ts": "T2", "run_id": "r2", "task": "empty-trash",
+                            "action": "deleted", "path": "/b", "recoverable": False}) + "\n")
+        f.write('{"ts":"T3","action":"trashed",  <-- deliberately truncated/broken\n')
+    m.init_action_log(log_path)
+
+    m.task_show_actions()
+    out = capsys.readouterr().out
+    assert "clean-caches: trashed /a" in out        # both valid records shown
+    assert "empty-trash: deleted /b" in out
+    assert "Put Back" in out                          # recover_via surfaced
+    assert "2 action(s)" in out                       # broken 3rd line skipped, not crashed
+
+
+def test_show_actions_filters_by_run_id(home_tmp_path, capsys):
+    m = load_module()
+    log_path = home_tmp_path / "actions.jsonl"
+    import json
+    with log_path.open("w") as f:
+        f.write(json.dumps({"ts": "T1", "run_id": "r1", "task": "clean-caches",
+                            "action": "trashed", "path": "/a", "recoverable": True}) + "\n")
+        f.write(json.dumps({"ts": "T2", "run_id": "r2", "task": "clean-logs",
+                            "action": "trashed", "path": "/b", "recoverable": True}) + "\n")
+    m.init_action_log(log_path)
+
+    m.task_show_actions(run_id="r2")
+    out = capsys.readouterr().out
+    assert "clean-logs: trashed /b" in out and "clean-caches" not in out
+    assert "1 action(s) for run r2" in out

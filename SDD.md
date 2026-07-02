@@ -281,13 +281,45 @@ Mode behavior rules.
   explicit `--archive-folder` list). No labels given → "nothing to do".
 - Reversal (`launchctl enable gui/$UID/<label>`) is printed in the success log.
 
+**11.17 Rollback facility (move-to-Trash + action log)**
+
+- The five recoverable deletion tasks (`clean-caches`, `clean-logs`,
+  `safari-cleanup`, `chrome-cleanup`, `clean-ios-backups`) move items to the macOS
+  Trash by default via `move_to_trash()`, instead of `unlink`/`rmtree`. Restore is
+  Finder → Trash → "Put Back". `--permanent` opts back into immediate unrecoverable
+  delete. `empty-trash` is hard-wired permanent (it IS the Trash) and ignores `--permanent`.
+- `move_to_trash()` shells to `osascript -l JavaScript` →
+  `NSFileManager.trashItemAtURLResultingItemURLError`. The path is passed **only as
+  argv**, never interpolated into the script (no JXA injection for names with
+  quotes/spaces/unicode). Both out-params are `null` and failure throws a static
+  string (dereferencing the NSError out-param segfaults osascript); success → exit 0,
+  failure → exit 1 with stderr. A trash failure logs and returns False — the caller
+  **never** falls back to a permanent delete (a trash failure must not become an
+  unrecoverable one).
+- Every apply-mode disposal (and each `disable-*`) appends a JSON record to an
+  append-only log (`--action-log`, default `~/.mac-maintenance/actions.jsonl`, mode
+  0o600, parent 0o700): `{ts, run_id, task, action, path, size_kb, recoverable,
+  recover_via, mode}`. Size is captured **before** disposal. The log lives outside
+  every cleanup target (not under `~/Library/Logs`, which `clean-logs` would trash).
+  Written in apply mode only — dry-run/report never write it.
+- `--task show-actions` (report-only) prints the log (optionally `--run-id`-filtered),
+  tolerating a truncated final line. It is the audit/rollback-review surface.
+- Auto-restore (`--task rollback`) is intentionally **not** implemented: after
+  cleanup the app regenerates the path so a blind `shutil.move` back would clobber
+  newer data, and Trash collision-renames (`Cache` → `Cache 2`) make basename lookup
+  ambiguous. Finder "Put Back" already does verified, non-clobbering restore. If
+  added later it must be dry-run-default, refuse-if-exists, and skip-ambiguous.
+- Known limits: the action log has no rotation (grows unbounded); the `~/.Trash`
+  assumption is home-volume-only (all five tasks target `~/Library`, on the home volume).
+
 ---
 
 **12. Data Model**
 
 - `CommandResult`: normalized output for report commands.
 - `ReportSection`: logical grouping of command results.
-- No persistent data storage beyond optional report output files.
+- Action log: append-only JSONL at `~/.mac-maintenance/actions.jsonl` (one record
+  per apply-mode action). No other persistent storage beyond optional report output.
 
 ---
 
@@ -367,6 +399,12 @@ Cache, trash, logs, and iOS backup parameters.
 - `--ios-backups-dir`
 - `--ios-backups-keep`
 
+Rollback / action-log parameters.
+
+- `--permanent` (delete instead of moving to Trash; `empty-trash` ignores it)
+- `--action-log` (default `~/.mac-maintenance/actions.jsonl`)
+- `--run-id` (filter `show-actions`)
+
 ---
 
 **14. Safety and Security**
@@ -376,6 +414,12 @@ Cache, trash, logs, and iOS backup parameters.
 - Home directory validation is enforced for user-writable targets.
 - Brew binary path is validated and requires an absolute executable path.
 - Chrome/Safari cleanup is scoped to expected profile/cache directories.
+- Deletions are recoverable by default: items move to the macOS Trash (Finder
+  "Put Back"); `--permanent` is required for an unrecoverable delete. A trash
+  failure never falls back to a permanent delete. Every apply-mode action is
+  recorded to an append-only action log for audit (`show-actions`). See §11.17.
+- `move_to_trash` passes the path only as `osascript` argv — never interpolated
+  into the JXA script — so hostile filenames cannot inject code.
 - Startup-item disabling uses `launchctl disable`, which is persistent but fully
   reversible via `launchctl enable gui/$UID/<label>` (printed in the success log).
   The tool never auto-disables — each label must be named explicitly.

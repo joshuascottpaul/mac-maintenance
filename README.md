@@ -40,6 +40,8 @@ cd mac-maintenance-darwin-arm64
 - HTML + CSS report generation
 - Safe defaults and explicit action flags
 - Disk cleanup: caches, Trash, logs, iOS backups (age-guarded, dry-run by default)
+- **Recoverable by default**: deletions move to the macOS Trash (restore via Finder → Put Back); `--permanent` opts into unrecoverable delete
+- **Action log**: every apply-mode action is recorded to `~/.mac-maintenance/actions.jsonl`; review it with `--task show-actions`
 - Browser cleanup: any Chromium channel (Beta/stable/other) plus Safari cache + site data
 - Bundle-ID-based orphan detection across Containers/Preferences/Saved State/App Scripts (report-only)
 - Startup-item control: list LaunchAgents, disable login items / launch agents (reversible)
@@ -69,6 +71,15 @@ Dry-run disk cleanup (caches, Trash, logs):
 
 ```bash
 python3 mac-maintenance.py --mode dry-run --task clean-caches --task empty-trash --task clean-logs
+```
+
+Apply cache cleanup (moves to Trash — recover via Finder "Put Back"), then review what happened:
+
+```bash
+python3 mac-maintenance.py --mode apply --task clean-caches
+python3 mac-maintenance.py --mode report --task show-actions        # audit the action log
+# ...or reclaim the space immediately with an unrecoverable delete:
+python3 mac-maintenance.py --mode apply --task clean-caches --permanent
 ```
 
 Find potential app leftovers by bundle ID (report-only, no deletion):
