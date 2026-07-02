@@ -202,17 +202,43 @@ tests — no test quits an app or disables a real startup item.
 Shipped: multi-channel Chromium cleanup, Safari cache/site-data cleanup,
 LaunchAgent discovery, and reversible login-item / launch-agent disabling.
 
-## Recommended next action
+## Backlog (prioritized)
 
-1. **Live with `find-bundle-orphans` for a while** before wiring up deletion for
-   it — the false-positive rate from helper-tool/Team-ID bundle IDs is real and
-   disclosed; deleting based on it today would be premature.
-2. **Remaining 2D**: Firefox cleanup (different profile/cache layout) and
-   `NSRecentDocuments` recent-items clearing.
-3. The two deferred Track 1C minor items (`run_brew` timeout typing,
-   `time.time()` → `time.monotonic()` in copy-speed-test) are still just sitting
-   there — low priority, fine to bundle into whatever PR touches those functions
-   next rather than a dedicated pass.
+Ranked by value ÷ (effort × risk). ✅ = done.
+
+### Tier 0 — housekeeping (trivial, zero-risk)
+- [x] **Track 1C minors** — `run_brew` timeout typed `Optional[int]` → `Optional[float]`;
+  `time.time()` → `time.monotonic()` for the copy-speed-test *duration* measurement
+  (the `_clean_dir_contents` age guard keeps `time.time()` — it compares to file
+  mtime, which is wall-clock). Done.
+
+### Tier 1 — next feature (best remaining value)
+- [ ] **Firefox cleanup** (`firefox-cleanup`) — highest-impact feature gap left
+  (Firefox is mainstream, unlike the Chrome *Beta* the tool started with). Extends
+  the proven `safari-cleanup`/`chrome-cleanup` pattern and **inherits move-to-Trash
+  + action logging for free** (destructive semantics already solved/tested). Work is
+  mapping the layout: `~/Library/Application Support/Firefox/Profiles/*/`
+  (`cache2`, `storage`, `startupCache`, …) + `~/Library/Caches/Firefox`. Reuse
+  `process_running("firefox")` / `close_app` and `_clean_dir_contents(permanent=...)`.
+  Medium effort, low risk.
+
+### Tier 2 — moderate value
+- [ ] **`NSRecentDocuments` / recent-items clearing** — CleanMyMac privacy parity.
+  Lower disk-space payoff; touches many per-app preference domains, so more edge-case
+  surface. A privacy nicety, not a space reclaimer.
+- [ ] **Action-log rotation** — the log at `~/.mac-maintenance/actions.jsonl` grows
+  unbounded (documented limit). Grows one line per action (slow), so low urgency;
+  fold in opportunistically, possibly alongside Firefox.
+
+### Tier 3 — gated on real-world use, NOT on code (do not start prematurely)
+- [ ] **`find-bundle-orphans` deletion wiring** — blocked on *living with* the current
+  report output to gauge the false-positive rate (helper-tool / Team-ID bundle IDs).
+  Building deletion before that observation period is exactly what the review warned
+  against. When unblocked, mirror `archive-orphans`: explicit user-curated list, no
+  auto-act, move-to-Trash by default.
+- [ ] **Auto-`rollback` command** — deferred by design; only worth building if Finder
+  "Put Back" proves insufficient in practice. If built: dry-run default,
+  refuse-if-original-exists, skip collision-ambiguous items (see Track 3 §).
 
 ---
 
