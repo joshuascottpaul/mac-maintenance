@@ -45,6 +45,7 @@ cd mac-maintenance-darwin-arm64
 - Browser cleanup: any Chromium channel (Beta/stable/other) plus Safari cache + site data
 - Bundle-ID-based orphan detection across Containers/Preferences/Saved State/App Scripts (report-only)
 - Startup-item control: list LaunchAgents, disable login items / launch agents (reversible)
+- iCloud eviction census + fix: find `dataless` (evicted) files that stall reads at 0% CPU, re-download them in parallel
 - Pytest suite for core behaviors
 
 ## Quick Start
@@ -104,6 +105,19 @@ python3 mac-maintenance.py --mode report --task find-launch-agents
 python3 mac-maintenance.py --mode apply --task disable-launch-agent --launch-agent com.example.updater
 python3 mac-maintenance.py --mode apply --task disable-login-item --login-item com.example.helper.loginitem
 # undo with: launchctl enable gui/$UID/<label>
+```
+
+iCloud eviction: census which folders under `~/Documents` have iCloud-evicted (`dataless`)
+files — the silent cause of "hangs at 0% CPU" reads — then force-download them.
+`report`/`dry-run` are stat-only and never trigger downloads; `apply` reads every evicted
+file through a thread pool (network-bound; iCloud may throttle). Useful before moving a
+folder out of iCloud scope, since moving evicted placeholders risks the data:
+
+```bash
+python3 mac-maintenance.py --mode report --task icloud-eviction                       # ~/Documents
+python3 mac-maintenance.py --mode report --task icloud-eviction --eviction-dir ~/Documents/GitHub
+python3 mac-maintenance.py --mode apply  --task icloud-eviction --eviction-dir ~/Documents/GitHub --eviction-jobs 16
+# spot-check a single file: ls -lO <file>   (evicted files show the "dataless" flag)
 ```
 
 ## Tests

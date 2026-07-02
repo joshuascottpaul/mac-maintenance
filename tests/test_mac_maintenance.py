@@ -814,3 +814,81 @@ def test_show_actions_filters_by_run_id(home_tmp_path, capsys):
     out = capsys.readouterr().out
     assert "clean-logs: trashed /b" in out and "clean-caches" not in out
     assert "1 action(s) for run r2" in out
+
+
+# --- icloud-eviction ----------------------------------------------------------
+
+class FakeStat:
+    def __init__(self, flags):
+        self.st_flags = flags
+
+
+def test_is_dataless_reads_sf_dataless_flag():
+    m = load_module()
+    assert m.is_dataless(FakeStat(m.SF_DATALESS))
+    assert m.is_dataless(FakeStat(m.SF_DATALESS | 0x1))
+    assert not m.is_dataless(FakeStat(0))
+    # Non-macOS stat objects have no st_flags at all — must not blow up.
+    assert not m.is_dataless(object())
+
+
+def test_scan_eviction_counts_per_top_entry(tmp_path):
+    m = load_module()
+    (tmp_path / "repo-a").mkdir()
+    (tmp_path / "repo-a" / "cold.bin").write_text("x")
+    (tmp_path / "repo-a" / "warm.txt").write_text("x")
+    (tmp_path / "repo-b" / "sub").mkdir(parents=True)
+    (tmp_path / "repo-b" / "sub" / "cold.bin").write_text("x")
+    (tmp_path / "toplevel.txt").write_text("x")
+
+    # scan_eviction stats real files and SF_DATALESS can't be set in a test,
+    # so mark "dataless" by size: cold files get a distinctive size of 2.
+    (tmp_path / "repo-a" / "cold.bin").write_text("xx")
+    (tmp_path / "repo-b" / "sub" / "cold.bin").write_text("xx")
+
+    per, dataless = m.scan_eviction(tmp_path, dataless_pred=lambda st: st.st_size == 2)
+    assert per["repo-a"] == [2, 1]
+    assert per["repo-b"] == [1, 1]
+    assert per["."] == [1, 0]
+    assert sorted(p.name for p in dataless) == ["cold.bin", "cold.bin"]
+
+
+def test_materialize_files_counts_ok_and_failed(tmp_path):
+    m = load_module()
+    files = []
+    for i in range(5):
+        f = tmp_path / f"f{i}"
+        f.write_text("data")
+        files.append(f)
+    calls = []
+
+    def reader(p):
+        calls.append(p)
+        return p.name != "f3"
+
+    ok, failed = m.materialize_files(files, jobs=2, reader=reader)
+    assert ok == 4 and failed == 1
+    assert sorted(c.name for c in calls) == ["f0", "f1", "f2", "f3", "f4"]
+
+
+def test_task_icloud_eviction_dry_run_never_reads(tmp_path):
+    m = load_module()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "cold").write_text("xx")
+    reads = []
+    m.task_icloud_eviction(tmp_path, m.MODE_DRY_RUN, jobs=2,
+                           dataless_pred=lambda st: st.st_size == 2,
+                           reader=lambda p: reads.append(p) or True)
+    assert reads == [], "dry-run must never materialize"
+
+
+def test_task_icloud_eviction_apply_reads_only_dataless(tmp_path):
+    m = load_module()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "cold").write_text("xx")     # size 2 = "dataless"
+    (tmp_path / "a" / "warm").write_text("x")
+    reads = []
+    m.task_icloud_eviction(tmp_path, m.MODE_APPLY, jobs=2,
+                           dataless_pred=lambda st: st.st_size == 2,
+                           reader=lambda p: reads.append(p) or True)
+    assert [p.name for p in reads] == ["cold"]

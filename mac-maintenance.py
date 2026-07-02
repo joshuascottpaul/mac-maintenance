@@ -47,6 +47,7 @@ TASK_FIND_LAUNCH_AGENTS = "find-launch-agents"
 TASK_DISABLE_LOGIN_ITEM = "disable-login-item"
 TASK_DISABLE_LAUNCH_AGENT = "disable-launch-agent"
 TASK_SHOW_ACTIONS = "show-actions"
+TASK_ICLOUD_EVICTION = "icloud-eviction"
 
 DEFAULT_CACHE_MIN_AGE_SECONDS = 300.0
 DEFAULT_LOGS_MIN_AGE_SECONDS = 300.0
@@ -1981,6 +1982,118 @@ def task_clean_caches(cache_dir: Path, mode: str, min_age_s: float = DEFAULT_CAC
     _clean_dir_contents(cache_dir, mode, "clean-caches", min_age_s=min_age_s, permanent=permanent)
 
 
+
+# --- icloud-eviction -----------------------------------------------------------
+# iCloud (Desktop & Documents sync / Optimize Mac Storage) evicts cold files:
+# they stay listed at full size but carry the SF_DATALESS flag, and the first
+# read blocks ~1s per file on an iCloud download at 0% CPU. A venv or repo
+# under ~/Documents can silently become minutes-to-hours slow ("import
+# anthropic" alone exceeded 4 minutes in the 2026-07-01 incident on a fully
+# evicted venv). report/dry-run = stat-only census (never materializes);
+# apply = materialize by reading every dataless file with a thread pool
+# (downloads are network-bound, so parallel reads help a lot).
+SF_DATALESS = 0x40000000
+
+
+def is_dataless(st: os.stat_result) -> bool:
+    """True when macOS reports the file's data as evicted (iCloud placeholder)."""
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
+
+def scan_eviction(root: Path, *, dataless_pred=None) -> Tuple[Dict[str, List[int]], List[Path]]:
+    """Stat-only census of `root`.
+
+    Returns (per_top_entry, dataless_paths) where per_top_entry maps each
+    immediate child of root (files grouped under ".") to [total_files,
+    dataless_files]. stat() never triggers materialization; only read() does.
+    `dataless_pred` is injectable for tests (real flag is macOS-only).
+    """
+    pred = dataless_pred or is_dataless
+    per: Dict[str, List[int]] = {}
+    dataless: List[Path] = []
+    root = root.expanduser()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        rel = Path(dirpath).relative_to(root)
+        top = rel.parts[0] if rel.parts else "."
+        bucket = per.setdefault(top, [0, 0])
+        for name in filenames:
+            fp = Path(dirpath) / name
+            try:
+                st = fp.lstat()
+            except OSError:
+                continue
+            bucket[0] += 1
+            if pred(st):
+                bucket[1] += 1
+                dataless.append(fp)
+    return per, dataless
+
+
+def materialize_files(paths: List[Path], *, jobs: int = 16,
+                      reader=None) -> Tuple[int, int]:
+    """Force-download dataless files by reading them. Returns (ok, failed).
+
+    `reader` is injectable for tests; the default streams the file in 1 MiB
+    chunks and discards them (materialization is whole-file on first read).
+    """
+    import concurrent.futures
+
+    def _read(p: Path) -> bool:
+        try:
+            with open(p, "rb") as f:
+                while f.read(1 << 20):
+                    pass
+            return True
+        except OSError:
+            return False
+
+    read = reader or _read
+    ok = failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        for success in ex.map(read, paths):
+            if success:
+                ok += 1
+            else:
+                failed += 1
+    return ok, failed
+
+
+def task_icloud_eviction(root: Path, mode: str, jobs: int = 16, *,
+                         dataless_pred=None, reader=None) -> None:
+    root = root.expanduser()
+    if not root.is_dir():
+        log(f"icloud-eviction: directory not found: {root}")
+        return
+
+    per, dataless = scan_eviction(root, dataless_pred=dataless_pred)
+    total_files = sum(v[0] for v in per.values())
+    total_dataless = len(dataless)
+    log(f"icloud-eviction: {root}: {total_files} files, {total_dataless} dataless (evicted)")
+    for entry, (files, d) in sorted(per.items(), key=lambda kv: -kv[1][1]):
+        if d:
+            pct = 100 * d // files if files else 0
+            log(f"  {entry}: {d}/{files} dataless ({pct}%)")
+    if not total_dataless:
+        log("icloud-eviction: nothing evicted — all file data is local")
+        return
+
+    if mode != MODE_APPLY:
+        log(f"icloud-eviction: {mode}: would materialize {total_dataless} file(s) "
+            f"with {jobs} parallel readers (--mode apply)")
+        return
+
+    log(f"icloud-eviction: materializing {total_dataless} file(s), {jobs} parallel readers "
+        "(network-bound; iCloud may throttle)")
+    ok, failed = materialize_files(dataless, jobs=jobs, reader=reader)
+    _, remaining = scan_eviction(root, dataless_pred=dataless_pred)
+    log_action(task="icloud-eviction", action=f"materialized read={ok} failed={failed} "
+               f"still_dataless={len(remaining)}", path=str(root))
+    log(f"icloud-eviction: read {ok}, failed {failed}, still dataless {len(remaining)}")
+    if remaining:
+        log("icloud-eviction: re-run apply for stragglers (iCloud throttling), or check "
+            "ls -lO on the leftovers")
+
+
 def task_empty_trash(trash_dir: Path, mode: str) -> None:
     # Hard-wired permanent: empty-trash IS the Trash — it must never try to
     # move items already in ~/.Trash back into the Trash. Ignores --permanent.
@@ -2288,6 +2401,7 @@ def parse_args() -> argparse.Namespace:
             TASK_DISABLE_LOGIN_ITEM,
             TASK_DISABLE_LAUNCH_AGENT,
             TASK_SHOW_ACTIONS,
+            TASK_ICLOUD_EVICTION,
         ],
         help="Task to run (repeatable).",
     )
@@ -2300,6 +2414,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--max-chars", type=int, default=20000)
     parser.add_argument("--max-lines", type=int, default=500)
+
+    parser.add_argument("--eviction-dir", default=str(Path.home() / "Documents"),
+                        help="Root to census/materialize for iCloud eviction (default ~/Documents).")
+    parser.add_argument("--eviction-jobs", type=int, default=16,
+                        help="Parallel readers for icloud-eviction apply (default 16).")
 
     parser.add_argument("--brew-bin", default=os.environ.get("BREW", "/opt/homebrew/bin/brew"))
     parser.add_argument("--brew-list-file", default=str(Path.home() / ".brew-list.txt"))
@@ -2485,6 +2604,13 @@ def main() -> int:
 
     if TASK_SHOW_ACTIONS in tasks:
         task_show_actions(run_id=args.run_id or None)
+
+    if TASK_ICLOUD_EVICTION in tasks:
+        task_icloud_eviction(
+            root=Path(args.eviction_dir),
+            mode=mode,
+            jobs=args.eviction_jobs,
+        )
 
     if TASK_FIND_BUNDLE_ORPHANS in tasks:
         task_find_bundle_orphans(Path(args.applications_dir), limit=args.orphans_limit)
