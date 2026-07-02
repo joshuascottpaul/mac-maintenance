@@ -1657,7 +1657,7 @@ def validate_brew_bin(brew_bin: str) -> str:
     return brew_bin
 
 
-def run_brew(brew_bin: str, args: List[str], timeout_s: Optional[int] = None) -> subprocess.CompletedProcess:
+def run_brew(brew_bin: str, args: List[str], timeout_s: Optional[float] = None) -> subprocess.CompletedProcess:
     cmd = [brew_bin] + args
     log("→ " + " ".join(shlex.quote(a) for a in cmd))
     return subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_s)
@@ -2223,7 +2223,7 @@ def task_copy_speed_test(src: Path, dst: Path, mode: str) -> None:
         return
 
     log(f"copy-speed-test: starting copy {src} -> {dst}")
-    start = time.time()
+    start = time.monotonic()
     proc = subprocess.run([
         "/usr/bin/rsync",
         "-ah",
@@ -2234,7 +2234,7 @@ def task_copy_speed_test(src: Path, dst: Path, mode: str) -> None:
         str(src),
         str(dst),
     ], text=True)
-    end = time.time()
+    end = time.monotonic()
     duration = max(1, int(end - start))
     if proc.returncode != 0:
         log(f"copy-speed-test: rsync failed with {proc.returncode}")
